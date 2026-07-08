@@ -1,5 +1,7 @@
 # Football Video Intelligence Pipeline: Tracking, Team Assignment, and Motion Analytics
 
+**Trained model on Hugging Face:** [`gianpaj/football-players-detection-1`](https://huggingface.co/gianpaj/football-players-detection-1) — fine-tuned YOLOv8x detecting players, goalkeepers, referees, and the ball. See [6.1 Get the trained model](#61-get-the-trained-model-recommended) to download the ready-to-use weights instead of training from scratch.
+
 ## 1. Overview
 This project is a computer-vision pipeline for football match analysis that transforms raw broadcast video into structured, frame-level analytics. It detects players, referees, and the ball; tracks entities across frames; compensates for camera motion; maps motion to a field-relative coordinate system; estimates player speed and distance; assigns teams by jersey color clustering; and estimates ball possession over time.
 
@@ -101,9 +103,35 @@ source .venv/bin/activate          # Linux/macOS
 pip install ultralytics supervision opencv-python numpy pandas scikit-learn roboflow
 ```
 
-### 6.1 Download the training dataset
+### 6.1 Get the trained model (recommended)
 
-The model weights are not included in this repo. Download the dataset from Roboflow (free account required at [roboflow.com](https://roboflow.com)):
+The trained weights are published on the Hugging Face Hub — no training required. Download `best.pt` and place it at the path `main.py` expects (`models/best.pt`):
+
+```bash
+# with the huggingface_hub CLI (pip install huggingface_hub)
+hf download gianpaj/football-players-detection-1 weights/best.pt --local-dir models/hf
+cp models/hf/weights/best.pt models/best.pt
+```
+
+Or from Python:
+
+```python
+from huggingface_hub import hf_hub_download
+import shutil
+
+path = hf_hub_download(repo_id="gianpaj/football-players-detection-1", filename="weights/best.pt")
+shutil.copy(path, "models/best.pt")
+```
+
+Model card, evaluation metrics, and training details: <https://huggingface.co/gianpaj/football-players-detection-1>
+
+> The model is a YOLOv8x fine-tune (4 classes: ball, goalkeeper, player, referee). It detects players/referees/goalkeepers very well (mAP50 ≥ 0.96) but ball detection is weak (recall ≈ 0.40) — the pipeline's ball interpolation compensates for the frequently-missed ball.
+
+If you just want to run the pipeline, skip to [6.4 Prepare input video](#64-prepare-input-video). Sections 6.2–6.3 below are only needed to retrain the model yourself.
+
+### 6.2 Download the training dataset (optional — for retraining)
+
+To retrain from scratch, download the dataset from Roboflow (free account required at [roboflow.com](https://roboflow.com)):
 
 ```python
 from roboflow import Roboflow
@@ -130,7 +158,7 @@ sed -i 's|../train/images|train/images|; s|../valid/images|valid/images|; s|../t
   models/football-players-detection-1/data.yaml
 ```
 
-### 6.2 Train the YOLO model
+### 6.3 Train the YOLO model (optional)
 
 ```bash
 uv run yolo train \
@@ -153,7 +181,7 @@ Copy the best weights to the expected path:
 cp models/football_yolo/weights/best.pt models/best.pt
 ```
 
-### 6.3 Prepare input video
+### 6.4 Prepare input video
 
 Place your broadcast football video at:
 ```
