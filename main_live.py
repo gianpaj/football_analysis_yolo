@@ -5,16 +5,22 @@ Mirrors ``main.py`` but for a live feed: pulls frames from an HLS ``.m3u8`` URL
 analytics incrementally, and streams per-frame JSON stats over a WebSocket for a
 downstream consumer to subscribe to.
 
-Fast path on Apple Silicon Mac (biggest single win):
-    python main_live.py --source <url> --device mps --imgsz 640 --inference-every 1
+Detection recall vs speed (imgsz is the biggest lever on a 1920-wide feed):
+    --imgsz 1280   default; good recall of distant players
+    --imgsz 1536   best recall, slower
+    --imgsz 960    faster, drops some far players
+    --inference-every 2   run YOLO every other frame to claw back FPS
 
-Even faster (lower update rate):
-    python main_live.py --source <url> --device mps --imgsz 640 --inference-every 2
+Player recall is driven by --imgsz and --conf; the ball is gated separately by
+--ball-conf, so keep --conf low (0.15) for player recall without phantom balls.
 
 Examples:
     python main_live.py --source <m3u8-url> --model models/best.pt --ws-port 8765
     python main_live.py --source 0 --no-ws --preview   # visual detection check
-    python main_live.py --source <url> --preview --preview-every 15
+    # headless/remote preview to a file (no display needed):
+    python main_live.py --source <url> --preview-file latest-frame.jpg --preview-every 15
+    # Apple Silicon, tuned for FPS:
+    python main_live.py --source <url> --device mps --imgsz 960 --inference-every 2
 """
 
 import argparse
@@ -61,16 +67,20 @@ def main():
                         help="Graphics region to ignore, as fractions 0..1 of the "
                              "frame (e.g. --ignore-region 0.04 0.03 0.36 0.10 for a "
                              "top-left scorebug). Repeatable.")
-    parser.add_argument("--conf", type=float, default=0.25,
-                        help="Global detection confidence floor (default 0.25). "
-                             "Raise to suppress phantom detections on a noisy feed.")
+    parser.add_argument("--conf", type=float, default=0.15,
+                        help="Global detection confidence floor (default 0.15). "
+                             "Kept low for player recall on wide broadcast shots; "
+                             "the ball is gated separately via --ball-conf, so this "
+                             "doesn't reintroduce phantom balls.")
     parser.add_argument("--ball-conf", type=float, default=0.4,
                         help="Stricter confidence floor for the ball class only "
                              "(default 0.4) — the noisiest class on a broadcast feed.")
-    parser.add_argument("--imgsz", type=int, default=None,
-                        help="Inference resolution override (e.g. 640 or 832). "
-                             "Lower values are much faster on CPU/MPS; 640 is a good "
-                             "live default, 1280 helps tiny ball recall.")
+    parser.add_argument("--imgsz", type=int, default=1280,
+                        help="Inference resolution (default 1280). Biggest lever "
+                             "for detecting distant/small players on a 1920-wide "
+                             "broadcast frame: 640 misses far players, 1536 catches "
+                             "the most. Lower it (or use --inference-every 2) if FPS "
+                             "suffers on your hardware.")
     parser.add_argument("--device", default=None,
                         help="YOLO device: 'mps' (Apple Silicon), 'cpu', 'cuda', or "
                              "GPU index. Omit for auto (mps preferred on Mac).")
