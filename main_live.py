@@ -3,15 +3,19 @@
 Mirrors ``main.py`` but for a live feed: pulls frames from an HLS ``.m3u8`` URL
 (or RTSP / webcam index / local file), runs the same detection / tracking /
 analytics incrementally, and streams per-frame JSON stats over a WebSocket for a
-downstream consumer to subscribe to. No on-screen display or recording.
+downstream consumer to subscribe to.
 
     python main_live.py --source <m3u8-url> --model models/best.pt --ws-port 8765
-    python main_live.py --source 0   # webcam smoke test
+    python main_live.py --source 0 --no-ws --preview   # visual detection check
+    python main_live.py --source <url> --preview --preview-every 15
 """
 
 import argparse
 
+import cv2
+
 from live import LiveFootballAnalyzer, ResilientCapture, StatsBroadcaster
+from live.preview import draw_stats_frame
 
 
 def main():
@@ -39,6 +43,10 @@ def main():
     parser.add_argument("--imgsz", type=int, default=None,
                         help="Inference resolution override (e.g. 1280). Larger "
                              "improves tiny-ball recall at the cost of FPS.")
+    parser.add_argument("--preview", action="store_true",
+                        help="Show an OpenCV window with detection overlays")
+    parser.add_argument("--preview-every", type=int, default=30, metavar="N",
+                        help="Refresh the preview window every N frames (default: 30)")
     args = parser.parse_args()
 
     broadcaster = None
@@ -54,21 +62,42 @@ def main():
     print(f"Opening source: {args.source}")
     capture = ResilientCapture(args.source).start()
 
+    preview_every = max(1, args.preview_every)
+
     try:
-        for stats in analyzer.run(capture, max_frames=args.max_frames):
+        run_iter = analyzer.run(
+            capture, max_frames=args.max_frames, return_frames=args.preview)
+
+        for item in run_iter:
+            if args.preview:
+                stats, frame = item
+            else:
+                stats = item
+
             if broadcaster is None:
                 print(stats)
             else:
                 ball = "ball" if stats["ball"] else "no-ball"
                 print(f"frame {stats['frame']:>6}  players={len(stats['players'])}  "
-                      f"{ball}  camera_stable={stats['camera_stable']}  "
+                      f"{ball}  tactical={stats['tactical']}  "
+                      f"camera_stable={stats['camera_stable']}  "
                       f"cut={stats['scene_cut']}")
+
+            if args.preview and stats["frame"] % preview_every == 0:
+                annotated = draw_stats_frame(analyzer.tracker, frame, stats)
+                cv2.imshow("Live football analysis", annotated)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("q"), 27):
+                    break
+
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
         capture.stop()
         if broadcaster is not None:
             broadcaster.stop()
+        if args.preview:
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

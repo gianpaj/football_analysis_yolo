@@ -281,9 +281,10 @@ class LiveFootballAnalyzer:
         return possession
 
     # -- run loop ------------------------------------------------------------
-    def run(self, capture, max_frames=None, read_timeout=5.0):
+    def run(self, capture, max_frames=None, read_timeout=5.0, return_frames=False):
         """Pull frames from a ``ResilientCapture`` and process until stopped.
-        Yields each stats dict (also broadcast if a broadcaster was given)."""
+        Yields each stats dict (also broadcast if a broadcaster was given).
+        When ``return_frames`` is True, yields ``(stats, frame)`` tuples instead."""
         processed = 0
         while True:
             if max_frames is not None and processed >= max_frames:
@@ -295,4 +296,7 @@ class LiveFootballAnalyzer:
             if self.broadcaster is not None:
                 self.broadcaster.broadcast(stats)
             processed += 1
-            yield stats
+            if return_frames:
+                yield stats, frame
+            else:
+                yield stats
