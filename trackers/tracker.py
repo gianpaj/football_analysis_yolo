@@ -7,10 +7,10 @@ import pandas as pd
 import cv2
 import sys 
 sys.path.append('../')
-from utils import get_center_of_bbox, get_bbox_width, get_foot_position
+from utils import get_center_of_bbox, get_bbox_width, get_foot_position, measure_distance
 
 class Tracker:
-    def __init__(self, model_path):
+    def __init__(self, model_path, max_ball_jump=250):
         self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack()
 
@@ -19,6 +19,7 @@ class Tracker:
         self._prev_ball_bbox = None          # ball bbox before the last one (for velocity)
         self._ball_missing_frames = 0        # consecutive frames without a fresh detection
         self._max_ball_hold_frames = 10      # after this many missed frames, report ball lost
+        self._max_ball_jump = max_ball_jump  # max plausible ball centre move between frames (px)
 
     def track_frame(self, frame):
         """Detect + track a single frame for the live pipeline.
@@ -57,14 +58,59 @@ class Tracker:
             if cls_id == cls_names_inv['referee']:
                 frame_tracks["referees"][track_id] = {"bbox": bbox}
 
+        # Collect every ball candidate (bbox + confidence) and pick the best one,
+        # rather than arbitrarily keeping the last in iteration order. On a busy
+        # frame the detector emits several phantom balls (grass/kit/logos); the
+        # naive "keep last" would grab a random one.
+        ball_candidates = []
         for frame_detection in detection_supervision:
-            bbox = frame_detection[0].tolist()
             cls_id = frame_detection[3]
-
             if cls_id == cls_names_inv['ball']:
-                frame_tracks["ball"][1] = {"bbox": bbox}
+                bbox = frame_detection[0].tolist()
+                conf = frame_detection[2]
+                ball_candidates.append((bbox, float(conf) if conf is not None else 0.0))
+
+        selected_ball = self._select_ball(ball_candidates)
+        if selected_ball is not None:
+            frame_tracks["ball"][1] = {"bbox": selected_ball}
 
         return frame_tracks
+
+    def _predicted_ball_center(self):
+        """Constant-velocity prediction of this frame's ball centre from the last
+        two known detections, or ``None`` if the ball hasn't been seen yet."""
+        if self._last_ball_bbox is None:
+            return None
+        last = get_center_of_bbox(self._last_ball_bbox)
+        if self._prev_ball_bbox is None:
+            return last
+        prev = get_center_of_bbox(self._prev_ball_bbox)
+        return (last[0] + (last[0] - prev[0]), last[1] + (last[1] - prev[1]))
+
+    def _select_ball(self, candidates):
+        """Choose the best ball from ``[(bbox, conf), ...]``.
+
+        Prefer the highest-confidence candidate, but first gate on trajectory
+        consistency: keep only candidates within ``_max_ball_jump`` px of the
+        predicted position so a phantom ball that teleports across the frame
+        can't win on confidence alone. If every candidate is far from the
+        prediction (genuine reappearance after occlusion), fall back to plain
+        highest confidence."""
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0][0]
+
+        predicted = self._predicted_ball_center()
+        if predicted is not None:
+            near = [(bbox, conf) for bbox, conf in candidates
+                    if measure_distance(get_center_of_bbox(bbox), predicted) <= self._max_ball_jump]
+            pool = near if near else candidates
+        else:
+            pool = candidates
+
+        best_bbox, _ = max(pool, key=lambda bc: bc[1])
+        return best_bbox
 
     def update_ball_position(self, ball_track_this_frame):
         """Streaming replacement for ``interpolate_ball_positions``.
