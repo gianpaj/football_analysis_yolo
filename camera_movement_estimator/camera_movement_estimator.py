@@ -29,6 +29,48 @@ class CameraMovementEstimator():
             mask = mask_features
         )
 
+        # Instance state for streaming (one-iteration-at-a-time) use. Seeded
+        # from the first frame the constructor already receives.
+        self.old_gray = first_frame_grayscale
+        self.old_features = cv2.goodFeaturesToTrack(self.old_gray, **self.features)
+
+    def reset(self, frame):
+        """Re-seed optical-flow state from ``frame``. Called on a scene cut so
+        we don't compound garbage flow across a hard camera cut."""
+        self.old_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.old_features = cv2.goodFeaturesToTrack(self.old_gray, **self.features)
+
+    def update(self, frame):
+        """Compute camera movement [dx, dy] between the previous frame and
+        ``frame`` for the live pipeline. One iteration of ``get_camera_movement``'s
+        loop body, carrying state on ``self`` instead of loop locals."""
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        camera_movement = [0, 0]
+
+        if self.old_features is not None and len(self.old_features) > 0:
+            new_features, _, _ = cv2.calcOpticalFlowPyrLK(
+                self.old_gray, frame_gray, self.old_features, None, **self.lk_params)
+
+            max_distance = 0
+            camera_movement_x, camera_movement_y = 0, 0
+
+            for new, old in zip(new_features, self.old_features):
+                new_features_point = new.ravel()
+                old_features_point = old.ravel()
+
+                distance = measure_distance(new_features_point, old_features_point)
+                if distance > max_distance:
+                    max_distance = distance
+                    camera_movement_x, camera_movement_y = measure_xy_distance(
+                        old_features_point, new_features_point)
+
+            if max_distance > self.minimum_distance:
+                camera_movement = [camera_movement_x, camera_movement_y]
+                self.old_features = cv2.goodFeaturesToTrack(frame_gray, **self.features)
+
+        self.old_gray = frame_gray.copy()
+        return camera_movement
+
     def add_adjust_positions_to_tracks(self,tracks, camera_movement_per_frame):
         for object, object_tracks in tracks.items():
             for frame_num, track in enumerate(object_tracks):

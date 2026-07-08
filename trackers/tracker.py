@@ -11,8 +11,105 @@ from utils import get_center_of_bbox, get_bbox_width, get_foot_position
 
 class Tracker:
     def __init__(self, model_path):
-        self.model = YOLO(model_path) 
+        self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack()
+
+        # Streaming ball hold/extrapolation state (used by the live pipeline).
+        self._last_ball_bbox = None          # last known ball bbox
+        self._prev_ball_bbox = None          # ball bbox before the last one (for velocity)
+        self._ball_missing_frames = 0        # consecutive frames without a fresh detection
+        self._max_ball_hold_frames = 10      # after this many missed frames, report ball lost
+
+    def track_frame(self, frame):
+        """Detect + track a single frame for the live pipeline.
+
+        Mirrors the per-frame logic inside ``get_object_tracks`` but for one
+        frame at a time. ``sv.ByteTrack`` is stateful across calls, so track IDs
+        stay consistent frame-to-frame without any batching.
+
+        Returns a dict ``{"players": {id: {"bbox": ...}}, "referees": {...},
+        "ball": {1: {"bbox": ...}} or {}}`` for this frame only.
+        """
+        detection = self.model.predict(frame, conf=0.1)[0]
+
+        cls_names = detection.names
+        cls_names_inv = {v: k for k, v in cls_names.items()}
+
+        detection_supervision = sv.Detections.from_ultralytics(detection)
+
+        # Convert GoalKeeper to player object
+        for object_ind, class_id in enumerate(detection_supervision.class_id):
+            if cls_names[class_id] == "goalkeeper":
+                detection_supervision.class_id[object_ind] = cls_names_inv["player"]
+
+        detection_with_tracks = self.tracker.update_with_detections(detection_supervision)
+
+        frame_tracks = {"players": {}, "referees": {}, "ball": {}}
+
+        for frame_detection in detection_with_tracks:
+            bbox = frame_detection[0].tolist()
+            cls_id = frame_detection[3]
+            track_id = frame_detection[4]
+
+            if cls_id == cls_names_inv['player']:
+                frame_tracks["players"][track_id] = {"bbox": bbox}
+
+            if cls_id == cls_names_inv['referee']:
+                frame_tracks["referees"][track_id] = {"bbox": bbox}
+
+        for frame_detection in detection_supervision:
+            bbox = frame_detection[0].tolist()
+            cls_id = frame_detection[3]
+
+            if cls_id == cls_names_inv['ball']:
+                frame_tracks["ball"][1] = {"bbox": bbox}
+
+        return frame_tracks
+
+    def update_ball_position(self, ball_track_this_frame):
+        """Streaming replacement for ``interpolate_ball_positions``.
+
+        Live feeds have no future frames to back-fill from, so instead of
+        interpolating we hold the last known ball bbox (with a simple
+        constant-velocity extrapolation from the last two detections) when the
+        ball isn't detected this frame. After ``_max_ball_hold_frames`` missed
+        frames we give up and report the ball as lost (returns ``None``).
+
+        ``ball_track_this_frame`` is the ``{1: {"bbox": ...}}`` dict from
+        ``track_frame`` (may be empty). Returns ``{"bbox": [...]}`` or ``None``.
+        """
+        detected = ball_track_this_frame.get(1)
+
+        if detected is not None:
+            bbox = detected["bbox"]
+            self._prev_ball_bbox = self._last_ball_bbox
+            self._last_ball_bbox = bbox
+            self._ball_missing_frames = 0
+            return {"bbox": list(bbox)}
+
+        # No detection this frame.
+        self._ball_missing_frames += 1
+
+        if self._last_ball_bbox is None or self._ball_missing_frames > self._max_ball_hold_frames:
+            return None
+
+        # Constant-velocity extrapolation when we have two prior detections,
+        # otherwise just hold the last known bbox.
+        if self._prev_ball_bbox is not None:
+            velocity = [c - p for c, p in zip(self._last_ball_bbox, self._prev_ball_bbox)]
+            extrapolated = [b + v * self._ball_missing_frames
+                            for b, v in zip(self._last_ball_bbox, velocity)]
+            return {"bbox": extrapolated}
+
+        return {"bbox": list(self._last_ball_bbox)}
+
+    def reset(self):
+        """Reset all inter-frame state. Called on a broadcast scene cut, where
+        ByteTrack IDs and the ball hold state are meaningless across the cut."""
+        self.tracker.reset()
+        self._last_ball_bbox = None
+        self._prev_ball_bbox = None
+        self._ball_missing_frames = 0
 
     def add_position_to_tracks(sekf,tracks):
         for object, object_tracks in tracks.items():
