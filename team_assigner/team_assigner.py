@@ -1,3 +1,4 @@
+import cv2
 from sklearn.cluster import KMeans
 
 class TeamAssigner:
@@ -17,6 +18,14 @@ class TeamAssigner:
 
     def get_player_color(self,frame,bbox):
         image = frame[int(bbox[1]):int(bbox[3]),int(bbox[0]):int(bbox[2])]
+
+        # Downscale the crop for faster KMeans while preserving colour.
+        # Live path hits this for every newly-seen track ID.
+        h, w = image.shape[:2]
+        if h > 40 or w > 30:
+            scale = min(40.0 / max(h, 1), 30.0 / max(w, 1), 1.0)
+            if scale < 1.0:
+                image = cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))))
 
         top_half_image = image[0:int(image.shape[0]/2),:]
 

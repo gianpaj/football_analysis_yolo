@@ -5,17 +5,44 @@ Mirrors ``main.py`` but for a live feed: pulls frames from an HLS ``.m3u8`` URL
 analytics incrementally, and streams per-frame JSON stats over a WebSocket for a
 downstream consumer to subscribe to.
 
+Fast path on Apple Silicon Mac (biggest single win):
+    python main_live.py --source <url> --device mps --imgsz 640 --inference-every 1
+
+Even faster (lower update rate):
+    python main_live.py --source <url> --device mps --imgsz 640 --inference-every 2
+
+Examples:
     python main_live.py --source <m3u8-url> --model models/best.pt --ws-port 8765
     python main_live.py --source 0 --no-ws --preview   # visual detection check
     python main_live.py --source <url> --preview --preview-every 15
 """
 
 import argparse
+import platform
+import time
 
 import cv2
 
 from live import LiveFootballAnalyzer, ResilientCapture, StatsBroadcaster
 from live.preview import draw_stats_frame
+
+
+def _default_device():
+    """Best-effort default for YOLO device on this machine.
+
+    Prefers 'mps' on Apple Silicon Macs (biggest live speedup).
+    Falls back to letting Ultralytics auto-pick otherwise.
+    """
+    if platform.system() == "Darwin":
+        # Apple Silicon Macs expose arm64 + MPS support in recent torch.
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                return "mps"
+        except Exception:
+            pass
+    # Let Ultralytics decide (cuda if present, else cpu, or mps if somehow missed).
+    return None
 
 
 def main():
@@ -41,8 +68,20 @@ def main():
                         help="Stricter confidence floor for the ball class only "
                              "(default 0.4) — the noisiest class on a broadcast feed.")
     parser.add_argument("--imgsz", type=int, default=None,
-                        help="Inference resolution override (e.g. 1280). Larger "
-                             "improves tiny-ball recall at the cost of FPS.")
+                        help="Inference resolution override (e.g. 640 or 832). "
+                             "Lower values are much faster on CPU/MPS; 640 is a good "
+                             "live default, 1280 helps tiny ball recall.")
+    parser.add_argument("--device", default=None,
+                        help="YOLO device: 'mps' (Apple Silicon), 'cpu', 'cuda', or "
+                             "GPU index. Omit for auto (mps preferred on Mac).")
+    parser.add_argument("--half", action="store_true",
+                        help="Use FP16 half precision for inference (faster on supported devices).")
+    parser.add_argument("--yolo-verbose", action="store_true",
+                        help="Enable verbose YOLO logging per frame (noisy, off by default).")
+    parser.add_argument("--inference-every", type=int, default=1, metavar="N",
+                        help="Run full YOLO detection + analytics every N frames "
+                             "(default 1 = every frame). Use 2 or 3 on slow hardware "
+                             "to trade update rate for higher FPS/latency.")
     parser.add_argument("--preview", action="store_true",
                         help="Show an OpenCV window with detection overlays")
     parser.add_argument("--preview-every", type=int, default=30, metavar="N",
@@ -54,15 +93,31 @@ def main():
         broadcaster = StatsBroadcaster(host=args.ws_host, port=args.ws_port).start()
         print(f"WebSocket server listening on ws://{args.ws_host}:{args.ws_port}")
 
-    analyzer = LiveFootballAnalyzer(args.model, broadcaster=broadcaster,
-                                    ignore_regions=args.ignore_region,
-                                    conf=args.conf, ball_conf=args.ball_conf,
-                                    imgsz=args.imgsz)
+    device = args.device if args.device is not None else _default_device()
+
+    analyzer = LiveFootballAnalyzer(
+        args.model,
+        broadcaster=broadcaster,
+        ignore_regions=args.ignore_region,
+        conf=args.conf,
+        ball_conf=args.ball_conf,
+        imgsz=args.imgsz,
+        device=device,
+        half=args.half,
+        yolo_verbose=args.yolo_verbose,
+        inference_stride=args.inference_every,
+    )
 
     print(f"Opening source: {args.source}")
+    print(f"Using device: {device or 'auto (ultralytics default)'}  half={args.half}")
     capture = ResilientCapture(args.source).start()
 
     preview_every = max(1, args.preview_every)
+
+    # FPS measurement (processing rate, not source rate)
+    t0 = time.monotonic()
+    frame_count = 0
+    last_fps_print = 0
 
     try:
         run_iter = analyzer.run(
@@ -74,14 +129,24 @@ def main():
             else:
                 stats = item
 
+            frame_count += 1
+            elapsed = time.monotonic() - t0
+            fps = frame_count / elapsed if elapsed > 0 else 0.0
+
             if broadcaster is None:
                 print(stats)
             else:
                 ball = "ball" if stats["ball"] else "no-ball"
+                inf = "det" if stats.get("inference", True) else "skip"
                 print(f"frame {stats['frame']:>6}  players={len(stats['players'])}  "
                       f"{ball}  tactical={stats['tactical']}  "
                       f"camera_stable={stats['camera_stable']}  "
-                      f"cut={stats['scene_cut']}")
+                      f"cut={stats['scene_cut']}  {inf}  fps={fps:.1f}")
+
+            # Periodic FPS hint even without WS
+            if broadcaster is None and (frame_count - last_fps_print) >= 30:
+                print(f"[info] processed {frame_count} frames @ {fps:.1f} fps (device={args.device or 'auto'})")
+                last_fps_print = frame_count
 
             if args.preview and stats["frame"] % preview_every == 0:
                 annotated = draw_stats_frame(analyzer.tracker, frame, stats)

@@ -11,8 +11,11 @@ from utils import get_center_of_bbox, get_bbox_width, get_foot_position, measure
 
 class Tracker:
     def __init__(self, model_path, max_ball_jump=250,
-                 conf=0.1, ball_conf=None, imgsz=None):
+                 conf=0.1, ball_conf=None, imgsz=None,
+                 device=None, half=False, verbose=False):
         self.model = YOLO(model_path)
+        if device is not None:
+            self.model.to(device)
         self.tracker = sv.ByteTrack()
 
         # Inference thresholds. ``conf`` is the global detection confidence
@@ -25,6 +28,9 @@ class Tracker:
         self._conf = conf
         self._ball_conf = ball_conf if ball_conf is not None else conf
         self._imgsz = imgsz
+        self._device = device
+        self._half = bool(half)
+        self._verbose = bool(verbose)
 
         # Streaming ball hold/extrapolation state (used by the live pipeline).
         self._last_ball_bbox = None          # last known ball bbox
@@ -43,9 +49,16 @@ class Tracker:
         Returns a dict ``{"players": {id: {"bbox": ...}}, "referees": {...},
         "ball": {1: {"bbox": ...}} or {}}`` for this frame only.
         """
-        predict_kwargs = {"conf": self._conf}
+        predict_kwargs = {
+            "conf": self._conf,
+            "verbose": self._verbose,
+        }
         if self._imgsz is not None:
             predict_kwargs["imgsz"] = self._imgsz
+        if self._device is not None:
+            predict_kwargs["device"] = self._device
+        if self._half:
+            predict_kwargs["half"] = True
         detection = self.model.predict(frame, **predict_kwargs)[0]
 
         cls_names = detection.names
@@ -206,7 +219,13 @@ class Tracker:
         batch_size=20 
         detections = [] 
         for i in range(0,len(frames),batch_size):
-            detections_batch = self.model.predict(frames[i:i+batch_size],conf=0.1)
+            detections_batch = self.model.predict(
+                frames[i:i+batch_size],
+                conf=0.1,
+                verbose=self._verbose,
+                device=self._device,
+                half=self._half,
+            )
             detections += detections_batch
         return detections
 

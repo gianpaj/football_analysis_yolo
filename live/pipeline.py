@@ -2,8 +2,12 @@
 
 Runs the same detection / tracking / analytics as the offline ``main.py`` but
 incrementally, one frame at a time, and emits a JSON-serialisable stats dict per
-frame (no on-screen drawing). See ``~/.claude/plans/eager-marinating-falcon.md``
-section 3 for the flow and the scene-cut reset contract.
+frame (no on-screen drawing).
+
+Speed knobs (passed from main_live.py):
+- device / half: YOLO acceleration (use "mps" + half=True on Apple Silicon)
+- imgsz: lower (640) = much higher FPS
+- inference_stride: run detection/analytics only every N frames
 """
 
 import time
@@ -38,11 +42,14 @@ class LiveFootballAnalyzer:
                  min_players_for_team_fit=6,
                  cut_cooldown_frames=15,
                  ignore_regions=None,
-                 conf=0.25, ball_conf=0.4, imgsz=None):
+                 conf=0.25, ball_conf=0.4, imgsz=None,
+                 device=None, half=False, yolo_verbose=False,
+                 inference_stride=1):
         self.calibration_size = calibration_size
         self.min_players_for_team_fit = min_players_for_team_fit
         self.cut_cooldown_frames = cut_cooldown_frames
         self.broadcaster = broadcaster
+        self.inference_stride = max(1, int(inference_stride))
 
         # Fixed broadcast graphics (scorebug, watermark, logos) sit in constant
         # screen regions and make the detector fire phantom balls/players there.
@@ -62,7 +69,8 @@ class LiveFootballAnalyzer:
         # (0.1) — it's the single biggest lever against phantom detections — and
         # a stricter one still for the noisy ball class.
         self.tracker = Tracker(model_path, conf=conf, ball_conf=ball_conf,
-                               imgsz=imgsz)
+                               imgsz=imgsz, device=device, half=half,
+                               verbose=yolo_verbose)
         # CameraMovementEstimator needs a seed frame; created lazily on frame 0.
         self.camera_movement_estimator = None
         self.view_transformer = ViewTransformer()
@@ -79,6 +87,16 @@ class LiveFootballAnalyzer:
         # Running team-ball-control tallies.
         self._team_possession_frames = {1: 0, 2: 0}
         self._last_possession_team = None
+
+        # For inference_stride > 1 we carry forward the last full tracks + stats
+        # on the cheap frames so ByteTrack keeps receiving frames only when we
+        # actually detect (we still advance camera flow on every frame).
+        self._last_tracks = None
+        self._last_players_out = None
+        self._last_referees_out = None
+        self._last_ball_out = None
+        self._last_possession = None
+        self._last_tactical = False
 
     # -- scene-cut reset contract -------------------------------------------
     def _apply_scene_cut_reset(self, frame):
@@ -109,49 +127,102 @@ class LiveFootballAnalyzer:
         scene_cut = self.scene_cut_detector.is_cut(self._prev_frame, frame)
         if scene_cut:
             self._apply_scene_cut_reset(frame)
+            # Force a fresh detection on the first frame after a cut.
+            self._last_tracks = None
 
-        # 3. Detect + track this frame, then drop detections that fall inside
-        #    fixed graphics regions (scorebug/watermark) so they can't become
-        #    phantom balls/players or skew the shot-type gate below.
-        tracks = self.tracker.track_frame(frame)
-        tracks = self._filter_ignored(tracks)
+        # Decide whether this frame runs the expensive YOLO + full analytics.
+        # We still always run cheap per-frame work: resize, scene cut, optical flow.
+        do_inference = (
+            self._last_tracks is None or
+            (self._frame_index % self.inference_stride == 0)
+        )
 
-        # 3b. Shot-type gate: is this a usable tactical wide shot? On a close-up /
-        #     replay / graphic, tactical output is meaningless and the detector
-        #     hallucinates (phantom balls, fragmented players), so gate it off.
-        tactical, _shot_info = self.shot_gate.update(frame, tracks["players"])
-
-        # 4. Camera movement + position adjustment.
+        # 4. Camera movement + position adjustment (cheap, run every frame).
         dx, dy = self.camera_movement_estimator.update(frame)
 
         camera_stable = self._cooldown_remaining == 0
-        # Pitch positions are only trusted on a stable, tactical wide shot.
-        positions_trusted = camera_stable and tactical
 
-        players_out = self._build_object_stats(
-            frame, tracks["players"], dx, dy, timestamp,
-            positions_trusted, tactical, is_player=True)
-        referees_out = self._build_object_stats(
-            frame, tracks["referees"], dx, dy, timestamp,
-            positions_trusted, tactical, is_player=False)
+        if do_inference:
+            # 3. Detect + track this frame, then drop detections that fall inside
+            #    fixed graphics regions (scorebug/watermark) so they can't become
+            #    phantom balls/players or skew the shot-type gate below.
+            tracks = self.tracker.track_frame(frame)
+            tracks = self._filter_ignored(tracks)
+            self._last_tracks = tracks
 
-        # 6. Ball hold/extrapolation. On a non-tactical shot the ball detections
-        #    are unreliable phantoms, so feed the tracker nothing (it holds then
-        #    reports the ball lost) rather than poisoning its trajectory state.
-        ball_input = tracks["ball"] if tactical else {}
-        ball_track = self.tracker.update_ball_position(ball_input)
-        ball_out = None
-        if ball_track is not None:
-            ball_position = self._transformed_position(
-                get_center_of_bbox(ball_track["bbox"]), dx, dy, positions_trusted)
-            ball_out = {
-                "bbox": [float(v) for v in ball_track["bbox"]],
-                "position": ball_position,
+            # 3b. Shot-type gate: is this a usable tactical wide shot? On a close-up /
+            #     replay / graphic, tactical output is meaningless and the detector
+            #     hallucinates (phantom balls, fragmented players), so gate it off.
+            tactical, _shot_info = self.shot_gate.update(frame, tracks["players"])
+            self._last_tactical = tactical
+
+            # Pitch positions are only trusted on a stable, tactical wide shot.
+            positions_trusted = camera_stable and tactical
+
+            players_out = self._build_object_stats(
+                frame, tracks["players"], dx, dy, timestamp,
+                positions_trusted, tactical, is_player=True)
+            referees_out = self._build_object_stats(
+                frame, tracks["referees"], dx, dy, timestamp,
+                positions_trusted, tactical, is_player=False)
+            self._last_players_out = players_out
+            self._last_referees_out = referees_out
+
+            # 6. Ball hold/extrapolation. On a non-tactical shot the ball detections
+            #    are unreliable phantoms, so feed the tracker nothing (it holds then
+            #    reports the ball lost) rather than poisoning its trajectory state.
+            ball_input = tracks["ball"] if tactical else {}
+            ball_track = self.tracker.update_ball_position(ball_input)
+            ball_out = None
+            if ball_track is not None:
+                ball_position = self._transformed_position(
+                    get_center_of_bbox(ball_track["bbox"]), dx, dy, positions_trusted)
+                ball_out = {
+                    "bbox": [float(v) for v in ball_track["bbox"]],
+                    "position": ball_position,
+                }
+            self._last_ball_out = ball_out
+
+            # 8. Ball possession + running team control (only on tactical shots).
+            possession = self._assign_possession(tracks["players"], ball_track,
+                                                  players_out, tactical)
+            self._last_possession = possession
+        else:
+            # Light frame (stride): reuse previous heavy results. We only advance
+            # the cheap state (camera flow already done, ball extrapolation below).
+            tracks = self._last_tracks or {"players": {}, "referees": {}, "ball": {}}
+            tactical = self._last_tactical
+
+            # Pitch positions trusted flag uses the *last* tactical decision.
+            positions_trusted = camera_stable and tactical
+
+            # Advance ball hold/extrapolation even on skipped detection frames.
+            # Feed *no* detection so the missing-frame counter and extrapolation
+            # advance as expected.
+            ball_input = {}
+            ball_track = self.tracker.update_ball_position(ball_input)
+            ball_out = None
+            if ball_track is not None:
+                ball_position = self._transformed_position(
+                    get_center_of_bbox(ball_track["bbox"]), dx, dy, positions_trusted)
+                ball_out = {
+                    "bbox": [float(v) for v in ball_track["bbox"]],
+                    "position": ball_position,
+                }
+            self._last_ball_out = ball_out
+
+            # Carry the last computed outputs (bboxes/speeds/teams are from the
+            # previous inference frame). This is the explicit speed vs freshness
+            # tradeoff controlled by --inference-every.
+            players_out = self._last_players_out or {}
+            referees_out = self._last_referees_out or {}
+            possession = self._last_possession or {
+                "team": None, "team_1_pct": None, "team_2_pct": None
             }
 
-        # 8. Ball possession + running team control (only on tactical shots).
-        possession = self._assign_possession(tracks["players"], ball_track,
-                                              players_out, tactical)
+            # Keep the shot gate alive on every frame (very cheap) so it can
+            # react quickly when the camera cuts to a close-up or back to wide.
+            self.shot_gate.update(frame, tracks.get("players", {}))
 
         if self._cooldown_remaining > 0:
             self._cooldown_remaining -= 1
@@ -168,6 +239,7 @@ class LiveFootballAnalyzer:
             "referees": referees_out,
             "ball": ball_out,
             "possession": possession,
+            "inference": bool(do_inference),   # tells consumers whether fresh detection ran
         }
         return stats
 
