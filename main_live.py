@@ -25,6 +25,11 @@ def main():
                         help="Stop after N frames (for testing)")
     parser.add_argument("--no-ws", action="store_true",
                         help="Disable the WebSocket server (print stats to stdout instead)")
+    parser.add_argument("--ignore-region", type=float, nargs=4, action="append",
+                        metavar=("X1", "Y1", "X2", "Y2"),
+                        help="Graphics region to ignore, as fractions 0..1 of the "
+                             "frame (e.g. --ignore-region 0.04 0.03 0.36 0.10 for a "
+                             "top-left scorebug). Repeatable.")
     args = parser.parse_args()
 
     broadcaster = None
@@ -32,7 +37,8 @@ def main():
         broadcaster = StatsBroadcaster(host=args.ws_host, port=args.ws_port).start()
         print(f"WebSocket server listening on ws://{args.ws_host}:{args.ws_port}")
 
-    analyzer = LiveFootballAnalyzer(args.model, broadcaster=broadcaster)
+    analyzer = LiveFootballAnalyzer(args.model, broadcaster=broadcaster,
+                                    ignore_regions=args.ignore_region)
 
     print(f"Opening source: {args.source}")
     capture = ResilientCapture(args.source).start()

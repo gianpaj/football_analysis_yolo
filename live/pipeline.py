@@ -36,11 +36,26 @@ class LiveFootballAnalyzer:
     def __init__(self, model_path, broadcaster=None,
                  calibration_size=(1920, 1080),
                  min_players_for_team_fit=6,
-                 cut_cooldown_frames=15):
+                 cut_cooldown_frames=15,
+                 ignore_regions=None):
         self.calibration_size = calibration_size
         self.min_players_for_team_fit = min_players_for_team_fit
         self.cut_cooldown_frames = cut_cooldown_frames
         self.broadcaster = broadcaster
+
+        # Fixed broadcast graphics (scorebug, watermark, logos) sit in constant
+        # screen regions and make the detector fire phantom balls/players there.
+        # ``ignore_regions`` is a list of [x1, y1, x2, y2] as fractions (0..1) of
+        # the calibration frame; any detection whose centre lands inside one is
+        # dropped. Broadcast-specific, so it's opt-in (default: no masking).
+        # Example for a top-left scorebug + top-right watermark:
+        #     ignore_regions=[[0.04, 0.03, 0.36, 0.10], [0.72, 0.0, 1.0, 0.14]]
+        self._ignore_rects_px = []
+        if ignore_regions:
+            width, height = calibration_size
+            for x1, y1, x2, y2 in ignore_regions:
+                self._ignore_rects_px.append(
+                    (x1 * width, y1 * height, x2 * width, y2 * height))
 
         self.tracker = Tracker(model_path)
         # CameraMovementEstimator needs a seed frame; created lazily on frame 0.
@@ -90,8 +105,11 @@ class LiveFootballAnalyzer:
         if scene_cut:
             self._apply_scene_cut_reset(frame)
 
-        # 3. Detect + track this frame.
+        # 3. Detect + track this frame, then drop detections that fall inside
+        #    fixed graphics regions (scorebug/watermark) so they can't become
+        #    phantom balls/players or skew the shot-type gate below.
         tracks = self.tracker.track_frame(frame)
+        tracks = self._filter_ignored(tracks)
 
         # 3b. Shot-type gate: is this a usable tactical wide shot? On a close-up /
         #     replay / graphic, tactical output is meaningless and the detector
@@ -147,6 +165,21 @@ class LiveFootballAnalyzer:
             "possession": possession,
         }
         return stats
+
+    def _filter_ignored(self, tracks):
+        """Drop detections whose bbox centre lands in a configured graphics
+        region. No-op when no ignore regions are set."""
+        if not self._ignore_rects_px:
+            return tracks
+        out = {"players": {}, "referees": {}, "ball": {}}
+        for kind, detections in tracks.items():
+            for track_id, info in detections.items():
+                x1, y1, x2, y2 = info["bbox"]
+                cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                if not any(rx1 <= cx <= rx2 and ry1 <= cy <= ry2
+                           for rx1, ry1, rx2, ry2 in self._ignore_rects_px):
+                    out[kind][track_id] = info
+        return out
 
     def _transformed_position(self, foot_or_center, dx, dy, positions_trusted):
         """Adjust a pixel position for camera movement and map to pitch coords.
