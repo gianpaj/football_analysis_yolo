@@ -30,6 +30,15 @@ def main():
                         help="Graphics region to ignore, as fractions 0..1 of the "
                              "frame (e.g. --ignore-region 0.04 0.03 0.36 0.10 for a "
                              "top-left scorebug). Repeatable.")
+    parser.add_argument("--conf", type=float, default=0.25,
+                        help="Global detection confidence floor (default 0.25). "
+                             "Raise to suppress phantom detections on a noisy feed.")
+    parser.add_argument("--ball-conf", type=float, default=0.4,
+                        help="Stricter confidence floor for the ball class only "
+                             "(default 0.4) — the noisiest class on a broadcast feed.")
+    parser.add_argument("--imgsz", type=int, default=None,
+                        help="Inference resolution override (e.g. 1280). Larger "
+                             "improves tiny-ball recall at the cost of FPS.")
     args = parser.parse_args()
 
     broadcaster = None
@@ -38,7 +47,9 @@ def main():
         print(f"WebSocket server listening on ws://{args.ws_host}:{args.ws_port}")
 
     analyzer = LiveFootballAnalyzer(args.model, broadcaster=broadcaster,
-                                    ignore_regions=args.ignore_region)
+                                    ignore_regions=args.ignore_region,
+                                    conf=args.conf, ball_conf=args.ball_conf,
+                                    imgsz=args.imgsz)
 
     print(f"Opening source: {args.source}")
     capture = ResilientCapture(args.source).start()

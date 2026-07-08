@@ -37,7 +37,8 @@ class LiveFootballAnalyzer:
                  calibration_size=(1920, 1080),
                  min_players_for_team_fit=6,
                  cut_cooldown_frames=15,
-                 ignore_regions=None):
+                 ignore_regions=None,
+                 conf=0.25, ball_conf=0.4, imgsz=None):
         self.calibration_size = calibration_size
         self.min_players_for_team_fit = min_players_for_team_fit
         self.cut_cooldown_frames = cut_cooldown_frames
@@ -57,7 +58,11 @@ class LiveFootballAnalyzer:
                 self._ignore_rects_px.append(
                     (x1 * width, y1 * height, x2 * width, y2 * height))
 
-        self.tracker = Tracker(model_path)
+        # Live feeds want a stricter confidence floor than the offline default
+        # (0.1) — it's the single biggest lever against phantom detections — and
+        # a stricter one still for the noisy ball class.
+        self.tracker = Tracker(model_path, conf=conf, ball_conf=ball_conf,
+                               imgsz=imgsz)
         # CameraMovementEstimator needs a seed frame; created lazily on frame 0.
         self.camera_movement_estimator = None
         self.view_transformer = ViewTransformer()

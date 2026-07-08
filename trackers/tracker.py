@@ -10,9 +10,21 @@ sys.path.append('../')
 from utils import get_center_of_bbox, get_bbox_width, get_foot_position, measure_distance
 
 class Tracker:
-    def __init__(self, model_path, max_ball_jump=250):
+    def __init__(self, model_path, max_ball_jump=250,
+                 conf=0.1, ball_conf=None, imgsz=None):
         self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack()
+
+        # Inference thresholds. ``conf`` is the global detection confidence
+        # floor; ``ball_conf`` is an optional *higher* floor applied only to the
+        # ball class (the noisiest — grass/kit/logos trigger phantom balls, so a
+        # broadcast feed wants it gated harder than players/refs). ``imgsz``
+        # overrides the inference resolution (larger = better tiny-ball recall,
+        # lower FPS). Defaults preserve the original behaviour so the offline
+        # ``main.py`` path is unchanged.
+        self._conf = conf
+        self._ball_conf = ball_conf if ball_conf is not None else conf
+        self._imgsz = imgsz
 
         # Streaming ball hold/extrapolation state (used by the live pipeline).
         self._last_ball_bbox = None          # last known ball bbox
@@ -31,7 +43,10 @@ class Tracker:
         Returns a dict ``{"players": {id: {"bbox": ...}}, "referees": {...},
         "ball": {1: {"bbox": ...}} or {}}`` for this frame only.
         """
-        detection = self.model.predict(frame, conf=0.1)[0]
+        predict_kwargs = {"conf": self._conf}
+        if self._imgsz is not None:
+            predict_kwargs["imgsz"] = self._imgsz
+        detection = self.model.predict(frame, **predict_kwargs)[0]
 
         cls_names = detection.names
         cls_names_inv = {v: k for k, v in cls_names.items()}
@@ -62,13 +77,20 @@ class Tracker:
         # rather than arbitrarily keeping the last in iteration order. On a busy
         # frame the detector emits several phantom balls (grass/kit/logos); the
         # naive "keep last" would grab a random one.
+        # The ball class gets a stricter confidence floor than players/refs
+        # (``_ball_conf``): on a broadcast feed the detector fires low-confidence
+        # phantom balls on grass, kit and logos, and a single wrong ball skews
+        # possession. Drop anything below the ball floor before trajectory
+        # selection even runs.
         ball_candidates = []
         for frame_detection in detection_supervision:
             cls_id = frame_detection[3]
             if cls_id == cls_names_inv['ball']:
                 bbox = frame_detection[0].tolist()
                 conf = frame_detection[2]
-                ball_candidates.append((bbox, float(conf) if conf is not None else 0.0))
+                conf = float(conf) if conf is not None else 0.0
+                if conf >= self._ball_conf:
+                    ball_candidates.append((bbox, conf))
 
         selected_ball = self._select_ball(ball_candidates)
         if selected_ball is not None:
