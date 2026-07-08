@@ -24,7 +24,7 @@ import time
 import cv2
 
 from live import LiveFootballAnalyzer, ResilientCapture, StatsBroadcaster
-from live.preview import draw_stats_frame
+from live.preview import draw_stats_frame, write_frame_atomic
 
 
 def _default_device():
@@ -83,9 +83,16 @@ def main():
                              "(default 1 = every frame). Use 2 or 3 on slow hardware "
                              "to trade update rate for higher FPS/latency.")
     parser.add_argument("--preview", action="store_true",
-                        help="Show an OpenCV window with detection overlays")
+                        help="Show an OpenCV window with detection overlays "
+                             "(needs a local display).")
+    parser.add_argument("--preview-file", default=None, metavar="PATH",
+                        help="Write the annotated frame to PATH every "
+                             "--preview-every frames (atomic overwrite). Works "
+                             "headless/over SSH — serve or sync the file to preview "
+                             "remotely, e.g. --preview-file latest-frame.jpg")
     parser.add_argument("--preview-every", type=int, default=30, metavar="N",
-                        help="Refresh the preview window every N frames (default: 30)")
+                        help="Refresh the preview window/file every N frames "
+                             "(default: 30).")
     args = parser.parse_args()
 
     broadcaster = None
@@ -113,6 +120,7 @@ def main():
     capture = ResilientCapture(args.source).start()
 
     preview_every = max(1, args.preview_every)
+    want_frames = args.preview or bool(args.preview_file)
 
     # FPS measurement (processing rate, not source rate)
     t0 = time.monotonic()
@@ -121,10 +129,10 @@ def main():
 
     try:
         run_iter = analyzer.run(
-            capture, max_frames=args.max_frames, return_frames=args.preview)
+            capture, max_frames=args.max_frames, return_frames=want_frames)
 
         for item in run_iter:
-            if args.preview:
+            if want_frames:
                 stats, frame = item
             else:
                 stats = item
@@ -148,12 +156,19 @@ def main():
                 print(f"[info] processed {frame_count} frames @ {fps:.1f} fps (device={args.device or 'auto'})")
                 last_fps_print = frame_count
 
-            if args.preview and stats["frame"] % preview_every == 0:
+            if want_frames and stats["frame"] % preview_every == 0:
                 annotated = draw_stats_frame(analyzer.tracker, frame, stats)
-                cv2.imshow("Live football analysis", annotated)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (ord("q"), 27):
-                    break
+
+                if args.preview_file:
+                    if not write_frame_atomic(args.preview_file, annotated):
+                        print(f"[warn] failed to encode preview frame to "
+                              f"{args.preview_file}")
+
+                if args.preview:
+                    cv2.imshow("Live football analysis", annotated)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord("q"), 27):
+                        break
 
     except KeyboardInterrupt:
         print("\nStopping...")
