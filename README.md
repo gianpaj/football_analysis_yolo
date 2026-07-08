@@ -198,6 +198,25 @@ python main_live.py --source https://example.com/stream.m3u8 --model models/best
 
 The live code lives in the additive `live/` package (`ResilientCapture`, `SceneCutDetector`, `StatsBroadcaster`, `LiveFootballAnalyzer`) and reuses the existing estimators via new streaming methods; the offline `main.py` path is unchanged. Known v1 limitations (multi-camera cuts gate position-derived stats rather than recalibrating homography; HLS inherently trails the live event by ~10–40 s; frames are resized to 1920×1080 to match the calibrated pixel constants) are documented in the plan and in `live/pipeline.py`.
 
+### 7.2 Benchmark detector backbones
+
+For a real-time feed, detector **latency** matters as much as mAP. `scripts/bench_models.py` compares candidate bases (e.g. `yolov8x` vs `yolo11m/l/x`) on val mAP — with the tiny-**ball** class AP called out separately — and median/p90 per-frame `predict` latency measured exactly how `Tracker.track_frame` calls it:
+
+```bash
+# latency-only shootout (downloads the bases on first use, no dataset needed)
+python scripts/bench_models.py \
+  --models yolov8x.pt yolo11m.pt yolo11l.pt yolo11x.pt \
+  --source data/test.mp4 --device 0
+
+# full accuracy + latency, fine-tuning each base on the football set first
+python scripts/bench_models.py \
+  --models yolov8x.pt yolo11m.pt yolo11l.pt \
+  --data models/football-players-detection-1/data.yaml \
+  --train --epochs 100 --imgsz 640 --device 0 --out bench_results.json
+```
+
+val mAP is only meaningful on weights fine-tuned on the football data (`--train`, or point `--models` at trained `best.pt` files); latency works on any base. Try `--imgsz 1280` to see the ball-recall vs latency trade-off.
+
 ## 8. Example Output
 Generated artifact:
 - `output_videos/output_video.avi`
