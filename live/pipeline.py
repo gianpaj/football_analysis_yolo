@@ -20,6 +20,7 @@ from player_ball_assigner import PlayerBallAssigner
 from utils import get_center_of_bbox, get_foot_position
 
 from .scene_cut import SceneCutDetector
+from .shot_gate import ShotTypeGate
 
 
 def _to_native(value):
@@ -49,6 +50,7 @@ class LiveFootballAnalyzer:
         self.team_assigner = TeamAssigner()
         self.player_ball_assigner = PlayerBallAssigner()
         self.scene_cut_detector = SceneCutDetector()
+        self.shot_gate = ShotTypeGate(min_players=min_players_for_team_fit)
 
         self._prev_frame = None
         self._frame_index = -1
@@ -65,6 +67,7 @@ class LiveFootballAnalyzer:
         self.speed_estimator.reset()
         if self.camera_movement_estimator is not None:
             self.camera_movement_estimator.reset(frame)
+        self.shot_gate.reset()
         self._cooldown_remaining = self.cut_cooldown_frames
 
     # -- per-frame processing -----------------------------------------------
@@ -90,32 +93,42 @@ class LiveFootballAnalyzer:
         # 3. Detect + track this frame.
         tracks = self.tracker.track_frame(frame)
 
+        # 3b. Shot-type gate: is this a usable tactical wide shot? On a close-up /
+        #     replay / graphic, tactical output is meaningless and the detector
+        #     hallucinates (phantom balls, fragmented players), so gate it off.
+        tactical, _shot_info = self.shot_gate.update(frame, tracks["players"])
+
         # 4. Camera movement + position adjustment.
         dx, dy = self.camera_movement_estimator.update(frame)
 
         camera_stable = self._cooldown_remaining == 0
+        # Pitch positions are only trusted on a stable, tactical wide shot.
+        positions_trusted = camera_stable and tactical
 
         players_out = self._build_object_stats(
             frame, tracks["players"], dx, dy, timestamp,
-            camera_stable, is_player=True)
+            positions_trusted, tactical, is_player=True)
         referees_out = self._build_object_stats(
             frame, tracks["referees"], dx, dy, timestamp,
-            camera_stable, is_player=False)
+            positions_trusted, tactical, is_player=False)
 
-        # 6. Ball hold/extrapolation.
-        ball_track = self.tracker.update_ball_position(tracks["ball"])
+        # 6. Ball hold/extrapolation. On a non-tactical shot the ball detections
+        #    are unreliable phantoms, so feed the tracker nothing (it holds then
+        #    reports the ball lost) rather than poisoning its trajectory state.
+        ball_input = tracks["ball"] if tactical else {}
+        ball_track = self.tracker.update_ball_position(ball_input)
         ball_out = None
         if ball_track is not None:
             ball_position = self._transformed_position(
-                get_center_of_bbox(ball_track["bbox"]), dx, dy, camera_stable)
+                get_center_of_bbox(ball_track["bbox"]), dx, dy, positions_trusted)
             ball_out = {
                 "bbox": [float(v) for v in ball_track["bbox"]],
                 "position": ball_position,
             }
 
-        # 8. Ball possession + running team control.
+        # 8. Ball possession + running team control (only on tactical shots).
         possession = self._assign_possession(tracks["players"], ball_track,
-                                              players_out)
+                                              players_out, tactical)
 
         if self._cooldown_remaining > 0:
             self._cooldown_remaining -= 1
@@ -127,6 +140,7 @@ class LiveFootballAnalyzer:
             "frame": self._frame_index,
             "scene_cut": bool(scene_cut),
             "camera_stable": bool(camera_stable),
+            "tactical": bool(tactical),
             "players": players_out,
             "referees": referees_out,
             "ball": ball_out,
@@ -134,10 +148,10 @@ class LiveFootballAnalyzer:
         }
         return stats
 
-    def _transformed_position(self, foot_or_center, dx, dy, camera_stable):
+    def _transformed_position(self, foot_or_center, dx, dy, positions_trusted):
         """Adjust a pixel position for camera movement and map to pitch coords.
         Returns ``[x, y]`` in pitch metres, or ``None`` when untrusted."""
-        if not camera_stable:
+        if not positions_trusted:
             return None
         adjusted = np.array([foot_or_center[0] - dx, foot_or_center[1] - dy])
         transformed = self.view_transformer.transform_point(adjusted)
@@ -146,9 +160,10 @@ class LiveFootballAnalyzer:
         return [float(v) for v in np.array(transformed).squeeze().tolist()]
 
     def _build_object_stats(self, frame, object_tracks, dx, dy, timestamp,
-                            camera_stable, is_player):
-        # 7. One-time team-colour fit once enough players are visible.
-        if (is_player and not self.team_assigner.is_fitted()
+                            positions_trusted, tactical, is_player):
+        # 7. One-time team-colour fit — only on a tactical shot with enough
+        #    players (a close-up at startup must not lock in wrong colours).
+        if (is_player and tactical and not self.team_assigner.is_fitted()
                 and len(object_tracks) >= self.min_players_for_team_fit):
             self.team_assigner.assign_team_color(frame, object_tracks)
 
@@ -158,7 +173,7 @@ class LiveFootballAnalyzer:
             entry = {"bbox": [float(v) for v in bbox]}
 
             position = self._transformed_position(
-                get_foot_position(bbox), dx, dy, camera_stable)
+                get_foot_position(bbox), dx, dy, positions_trusted)
             entry["position"] = position
 
             if is_player:
@@ -187,33 +202,37 @@ class LiveFootballAnalyzer:
             out[str(track_id)] = entry
         return out
 
-    def _assign_possession(self, player_tracks, ball_track, players_out):
+    def _assign_possession(self, player_tracks, ball_track, players_out, tactical):
         possession = {
             "team": None,
             "team_1_pct": None,
             "team_2_pct": None,
         }
 
-        assigned_team = None
-        if ball_track is not None and player_tracks:
-            assigned_player = self.player_ball_assigner.assign_ball_to_player(
-                player_tracks, ball_track["bbox"])
-            if assigned_player != -1:
-                key = str(assigned_player)
-                if key in players_out:
-                    players_out[key]["has_ball"] = True
-                    assigned_team = players_out[key].get("team")
+        # Only accumulate possession on tactical shots — a close-up / replay
+        # isn't observing the match, so carrying possession forward through it
+        # would inflate whichever team last held the ball.
+        if tactical:
+            assigned_team = None
+            if ball_track is not None and player_tracks:
+                assigned_player = self.player_ball_assigner.assign_ball_to_player(
+                    player_tracks, ball_track["bbox"])
+                if assigned_player != -1:
+                    key = str(assigned_player)
+                    if key in players_out:
+                        players_out[key]["has_ball"] = True
+                        assigned_team = players_out[key].get("team")
 
-        # Carry possession forward when nobody is assigned this frame, matching
-        # main.py's team_ball_control[-1] behaviour — but without the IndexError
-        # when no team has ever had the ball.
-        if assigned_team is None:
-            assigned_team = self._last_possession_team
-        else:
-            self._last_possession_team = assigned_team
+            # Carry possession forward when nobody is assigned this frame,
+            # matching main.py's team_ball_control[-1] behaviour — but without
+            # the IndexError when no team has ever had the ball.
+            if assigned_team is None:
+                assigned_team = self._last_possession_team
+            else:
+                self._last_possession_team = assigned_team
 
-        if assigned_team in (1, 2):
-            self._team_possession_frames[assigned_team] += 1
+            if assigned_team in (1, 2):
+                self._team_possession_frames[assigned_team] += 1
 
         total = self._team_possession_frames[1] + self._team_possession_frames[2]
         if total > 0:
