@@ -7,18 +7,37 @@ import pandas as pd
 import cv2
 import sys 
 sys.path.append('../')
-from utils import get_center_of_bbox, get_bbox_width, get_foot_position
+from utils import get_center_of_bbox, get_bbox_width, get_foot_position, measure_distance
 
 class Tracker:
-    def __init__(self, model_path):
+    def __init__(self, model_path, max_ball_jump=250,
+                 conf=0.1, ball_conf=None, imgsz=None,
+                 device=None, half=False, verbose=False):
         self.model = YOLO(model_path)
+        if device is not None:
+            self.model.to(device)
         self.tracker = sv.ByteTrack()
+
+        # Inference thresholds. ``conf`` is the global detection confidence
+        # floor; ``ball_conf`` is an optional *higher* floor applied only to the
+        # ball class (the noisiest — grass/kit/logos trigger phantom balls, so a
+        # broadcast feed wants it gated harder than players/refs). ``imgsz``
+        # overrides the inference resolution (larger = better tiny-ball recall,
+        # lower FPS). Defaults preserve the original behaviour so the offline
+        # ``main.py`` path is unchanged.
+        self._conf = conf
+        self._ball_conf = ball_conf if ball_conf is not None else conf
+        self._imgsz = imgsz
+        self._device = device
+        self._half = bool(half)
+        self._verbose = bool(verbose)
 
         # Streaming ball hold/extrapolation state (used by the live pipeline).
         self._last_ball_bbox = None          # last known ball bbox
         self._prev_ball_bbox = None          # ball bbox before the last one (for velocity)
         self._ball_missing_frames = 0        # consecutive frames without a fresh detection
         self._max_ball_hold_frames = 10      # after this many missed frames, report ball lost
+        self._max_ball_jump = max_ball_jump  # max plausible ball centre move between frames (px)
 
     def track_frame(self, frame):
         """Detect + track a single frame for the live pipeline.
@@ -30,7 +49,17 @@ class Tracker:
         Returns a dict ``{"players": {id: {"bbox": ...}}, "referees": {...},
         "ball": {1: {"bbox": ...}} or {}}`` for this frame only.
         """
-        detection = self.model.predict(frame, conf=0.1)[0]
+        predict_kwargs = {
+            "conf": self._conf,
+            "verbose": self._verbose,
+        }
+        if self._imgsz is not None:
+            predict_kwargs["imgsz"] = self._imgsz
+        if self._device is not None:
+            predict_kwargs["device"] = self._device
+        if self._half:
+            predict_kwargs["half"] = True
+        detection = self.model.predict(frame, **predict_kwargs)[0]
 
         cls_names = detection.names
         cls_names_inv = {v: k for k, v in cls_names.items()}
@@ -57,14 +86,66 @@ class Tracker:
             if cls_id == cls_names_inv['referee']:
                 frame_tracks["referees"][track_id] = {"bbox": bbox}
 
+        # Collect every ball candidate (bbox + confidence) and pick the best one,
+        # rather than arbitrarily keeping the last in iteration order. On a busy
+        # frame the detector emits several phantom balls (grass/kit/logos); the
+        # naive "keep last" would grab a random one.
+        # The ball class gets a stricter confidence floor than players/refs
+        # (``_ball_conf``): on a broadcast feed the detector fires low-confidence
+        # phantom balls on grass, kit and logos, and a single wrong ball skews
+        # possession. Drop anything below the ball floor before trajectory
+        # selection even runs.
+        ball_candidates = []
         for frame_detection in detection_supervision:
-            bbox = frame_detection[0].tolist()
             cls_id = frame_detection[3]
-
             if cls_id == cls_names_inv['ball']:
-                frame_tracks["ball"][1] = {"bbox": bbox}
+                bbox = frame_detection[0].tolist()
+                conf = frame_detection[2]
+                conf = float(conf) if conf is not None else 0.0
+                if conf >= self._ball_conf:
+                    ball_candidates.append((bbox, conf))
+
+        selected_ball = self._select_ball(ball_candidates)
+        if selected_ball is not None:
+            frame_tracks["ball"][1] = {"bbox": selected_ball}
 
         return frame_tracks
+
+    def _predicted_ball_center(self):
+        """Constant-velocity prediction of this frame's ball centre from the last
+        two known detections, or ``None`` if the ball hasn't been seen yet."""
+        if self._last_ball_bbox is None:
+            return None
+        last = get_center_of_bbox(self._last_ball_bbox)
+        if self._prev_ball_bbox is None:
+            return last
+        prev = get_center_of_bbox(self._prev_ball_bbox)
+        return (last[0] + (last[0] - prev[0]), last[1] + (last[1] - prev[1]))
+
+    def _select_ball(self, candidates):
+        """Choose the best ball from ``[(bbox, conf), ...]``.
+
+        Prefer the highest-confidence candidate, but first gate on trajectory
+        consistency: keep only candidates within ``_max_ball_jump`` px of the
+        predicted position so a phantom ball that teleports across the frame
+        can't win on confidence alone. If every candidate is far from the
+        prediction (genuine reappearance after occlusion), fall back to plain
+        highest confidence."""
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0][0]
+
+        predicted = self._predicted_ball_center()
+        if predicted is not None:
+            near = [(bbox, conf) for bbox, conf in candidates
+                    if measure_distance(get_center_of_bbox(bbox), predicted) <= self._max_ball_jump]
+            pool = near if near else candidates
+        else:
+            pool = candidates
+
+        best_bbox, _ = max(pool, key=lambda bc: bc[1])
+        return best_bbox
 
     def update_ball_position(self, ball_track_this_frame):
         """Streaming replacement for ``interpolate_ball_positions``.
@@ -138,7 +219,13 @@ class Tracker:
         batch_size=20 
         detections = [] 
         for i in range(0,len(frames),batch_size):
-            detections_batch = self.model.predict(frames[i:i+batch_size],conf=0.1)
+            detections_batch = self.model.predict(
+                frames[i:i+batch_size],
+                conf=0.1,
+                verbose=self._verbose,
+                device=self._device,
+                half=self._half,
+            )
             detections += detections_batch
         return detections
 
