@@ -58,7 +58,12 @@ def fine_tune(base, data, epochs, imgsz, device, project, name):
     model = YOLO(base)
     model.train(data=data, epochs=epochs, imgsz=imgsz, device=device,
                 project=project, name=name, exist_ok=True, verbose=False)
-    best = Path(project) / name / "weights" / "best.pt"
+    # Read the actual best.pt path from the trainer rather than reconstructing
+    # it: Ultralytics resolves the save dir via its runs_dir setting, so a
+    # relative `project` can land under runs/detect/ instead of where we'd guess.
+    best = getattr(model.trainer, "best", None)
+    if best is None or not Path(best).exists():
+        best = Path(model.trainer.save_dir) / "weights" / "best.pt"
     return str(best)
 
 
@@ -203,9 +208,16 @@ def main():
         results.append(row)
 
     # Summary table.
-    _log("\n" + "=" * 78)
-    _log(f"{'model':<28}{'mAP50-95':>10}{'ball mAP':>10}{'median ms':>12}{'FPS':>8}")
-    _log("-" * 78)
+    def _label(path):
+        # For a trained .../<run>/weights/best.pt show <run>; else the stem.
+        p = Path(path)
+        if p.name.endswith(".pt") and p.parent.name == "weights":
+            return p.parent.parent.name
+        return p.stem
+
+    _log("\n" + "=" * 66)
+    _log(f"{'model':<24}{'mAP50-95':>10}{'ball mAP':>10}{'median ms':>12}{'FPS':>10}")
+    _log("-" * 66)
     for r in results:
         acc = r.get("accuracy") or {}
         lat = r.get("latency") or {}
@@ -213,8 +225,8 @@ def main():
         b = acc.get("ball_map50_95", "-")
         ms = lat.get("median_ms", "-")
         fps = lat.get("fps_median", "-")
-        _log(f"{r['model']:<28}{str(m):>10}{str(b):>10}{str(ms):>12}{str(fps):>8}")
-    _log("=" * 78)
+        _log(f"{_label(r['model']):<24}{str(m):>10}{str(b):>10}{str(ms):>12}{str(fps):>10}")
+    _log("=" * 66)
 
     if args.out:
         Path(args.out).write_text(json.dumps(results, indent=2))
