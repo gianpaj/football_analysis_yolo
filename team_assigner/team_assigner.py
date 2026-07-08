@@ -56,7 +56,19 @@ class TeamAssigner:
         self.team_colors[2] = kmeans.cluster_centers_[1]
 
 
-    def get_player_team(self,frame,player_bbox,player_id):
+    def reset_player_cache(self):
+        """Clear the per-track team cache. Must be called on every tracker
+        reset (scene cut): ByteTrack IDs are re-issued after a reset, so stale
+        entries would mis-assign teams and the dict would grow without bound.
+        The fitted ``self.kmeans`` / ``team_colors`` are ID-independent (pure
+        jersey colour) and are intentionally kept."""
+        self.player_team_dict = {}
+
+    def is_fitted(self):
+        """True once ``assign_team_color`` has fitted the clustering model."""
+        return hasattr(self, "kmeans")
+
+    def get_player_team(self,frame,player_bbox,player_id, live=False):
         if player_id in self.player_team_dict:
             return self.player_team_dict[player_id]
 
@@ -65,7 +77,10 @@ class TeamAssigner:
         team_id = self.kmeans.predict(player_color.reshape(1,-1))[0]
         team_id+=1
 
-        if player_id ==91:
+        # The player_id==91 override is a manual correction for one track in the
+        # sample clip; it must not fire on a live feed, where whichever player
+        # happens to draw ID 91 would be force-assigned to team 1.
+        if not live and player_id == 91:
             team_id=1
 
         self.player_team_dict[player_id] = team_id

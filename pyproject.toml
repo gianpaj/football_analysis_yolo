@@ -11,10 +11,12 @@ dependencies = [
     "pandas>=2.0",
     "scikit-learn>=1.3",
     "roboflow>=1.3.10",
+    "websockets>=11",
 ]
 
 [project.scripts]
 football-analysis = "main:main"
+football-analysis-live = "main_live:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -29,4 +31,5 @@ packages = [
     "team_assigner",
     "player_ball_assigner",
     "utils",
+    "live",
 ]

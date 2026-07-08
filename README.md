@@ -182,6 +182,22 @@ Implementation note:
 - `main.py` currently reads detection/tracking and camera-motion data from stubs (`read_from_stub=True`) for faster development loops.
 - Set these flags to `False` in `main.py` to recompute from raw video.
 
+### 7.1 Live pipeline (HLS / RTSP / webcam → WebSocket)
+
+`main.py` above is the **offline batch** path: it loads a whole recorded file, analyses it, and writes an annotated video. For a **live broadcast feed** there is a separate incremental path that runs the same detection/tracking/analytics frame-by-frame and streams structured JSON stats over a WebSocket instead of drawing to screen:
+
+```bash
+# webcam smoke test (index 0), prints per-frame summaries to stdout
+python main_live.py --source 0 --no-ws
+
+# real broadcast HLS feed, stats served to WebSocket subscribers on :8765
+python main_live.py --source https://example.com/stream.m3u8 --model models/best.pt --ws-port 8765
+```
+
+`--source` accepts an HLS `.m3u8` URL, an RTSP URL, a local file, or a webcam index. Connect any WebSocket client to `ws://<host>:8765` to receive one JSON message per processed frame: player positions/teams/speeds, ball position (or `null` when lost), running possession %, and a `camera_stable` flag.
+
+The live code lives in the additive `live/` package (`ResilientCapture`, `SceneCutDetector`, `StatsBroadcaster`, `LiveFootballAnalyzer`) and reuses the existing estimators via new streaming methods; the offline `main.py` path is unchanged. Known v1 limitations (multi-camera cuts gate position-derived stats rather than recalibrating homography; HLS inherently trails the live event by ~10–40 s; frames are resized to 1920×1080 to match the calibrated pixel constants) are documented in the plan and in `live/pipeline.py`.
+
 ## 8. Example Output
 Generated artifact:
 - `output_videos/output_video.avi`
