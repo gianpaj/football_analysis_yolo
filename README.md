@@ -62,53 +62,121 @@ football_analysis_yolo/
 +-- yolo_inference.py                       # Standalone YOLO inference test script
 +-- image.png                               # Sample output snapshot
 +-- trackers/
-¦   +-- tracker.py                          # Detection, ByteTrack tracking, annotations
+ï¿½   +-- tracker.py                          # Detection, ByteTrack tracking, annotations
 +-- camera_movement_estimator/
-¦   +-- camera_movement_estimator.py        # Optical-flow camera motion estimation
+ï¿½   +-- camera_movement_estimator.py        # Optical-flow camera motion estimation
 +-- view_transformer/
-¦   +-- view_transformer.py                 # Perspective mapping to field coordinates
+ï¿½   +-- view_transformer.py                 # Perspective mapping to field coordinates
 +-- speed_and_distance_estimator/
-¦   +-- speed_and_distance_estimator.py     # Speed/distance computation and overlays
+ï¿½   +-- speed_and_distance_estimator.py     # Speed/distance computation and overlays
 +-- team_assigner/
-¦   +-- team_assigner.py                    # Team clustering from jersey color features
+ï¿½   +-- team_assigner.py                    # Team clustering from jersey color features
 +-- player_ball_assigner/
-¦   +-- player_ball_assigner.py             # Ball possession assignment heuristic
+ï¿½   +-- player_ball_assigner.py             # Ball possession assignment heuristic
 +-- utils/
-¦   +-- video_utils.py                      # Video read/write helpers
-¦   +-- bbox_utils.py                       # Geometric and distance helper functions
+ï¿½   +-- video_utils.py                      # Video read/write helpers
+ï¿½   +-- bbox_utils.py                       # Geometric and distance helper functions
 +-- stubs/
     +-- track_stubs.pkl                     # Cached object tracks
     +-- camera_movement_stub.pkl            # Cached camera motion values
 ```
 
 ## 6. Installation
+
+### Option A â€” uv (recommended)
+```bash
+git clone <your-repo-url>
+cd football_analysis_yolo
+uv sync
+```
+
+### Option B â€” pip
 ```bash
 git clone <your-repo-url>
 cd football_analysis_yolo
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# Linux/macOS
-# source .venv/bin/activate
+source .venv/bin/activate          # Linux/macOS
+# .venv\Scripts\activate           # Windows
 
-pip install ultralytics supervision opencv-python numpy pandas scikit-learn
+pip install ultralytics supervision opencv-python numpy pandas scikit-learn roboflow
 ```
 
-Required local assets before execution:
-- Model weights at `models/best.pt`
-- Input video at `data/test.mp4`
-- Output directory `output_videos/` (create if missing)
+### 6.1 Download the training dataset
+
+The model weights are not included in this repo. Download the dataset from Roboflow (free account required at [roboflow.com](https://roboflow.com)):
+
+```python
+from roboflow import Roboflow
+
+rf = Roboflow(api_key="YOUR_API_KEY")
+project = rf.workspace("roboflow-jvuqo").project("football-players-detection-3zvbc")
+version = project.version(1)
+version.download("yolov8", location="models/football-players-detection-1")
+```
+
+This creates:
+```
+models/football-players-detection-1/
+  data.yaml
+  train/images/   (612 images)
+  valid/images/   (38 images)
+  test/images/
+```
+
+Fix the paths in `data.yaml` (Roboflow generates them with a leading `../` that is incorrect for this layout):
+
+```bash
+sed -i 's|../train/images|train/images|; s|../valid/images|valid/images|; s|../test/images|test/images|' \
+  models/football-players-detection-1/data.yaml
+```
+
+### 6.2 Train the YOLO model
+
+```bash
+uv run yolo train \
+  model=yolov8x.pt \
+  data=models/football-players-detection-1/data.yaml \
+  epochs=100 \
+  imgsz=640 \
+  project=models \
+  name=football_yolo \
+  device=0
+```
+
+- `device=0` uses the first GPU. Use `device=cpu` if no GPU is available (much slower).
+- Swap `yolov8x.pt` for `yolov8n.pt` (nano) for a quick smoke-test run before committing to the full training.
+- Training on an RTX 4060 Ti takes roughly 30â€“60 minutes for 100 epochs.
+
+Copy the best weights to the expected path:
+
+```bash
+cp models/football_yolo/weights/best.pt models/best.pt
+```
+
+### 6.3 Prepare input video
+
+Place your broadcast football video at:
+```
+data/test.mp4
+```
 
 ## 7. Usage
+
 Run the full analysis pipeline:
 ```bash
+# with uv
+uv run python main.py
+
+# or with activated venv
 python main.py
 ```
 
 Run YOLO-only quick check:
 ```bash
-python yolo_inference.py
+uv run python yolo_inference.py
 ```
+
+Output is written to `output_videos/output_video.avi` (directory is created automatically).
 
 Implementation note:
 - `main.py` currently reads detection/tracking and camera-motion data from stubs (`read_from_stub=True`) for faster development loops.

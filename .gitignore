@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# YOLO weights & training artifacts
+*.pt
+models/
+runs/
+
+# Pipeline I/O
+data/
+output_videos/
+
+# uv
+.uv/
+
+# IDE
+.idea/
+.vscode/

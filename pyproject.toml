@@ -1,0 +1,32 @@
+[project]
+name = "football-analysis-yolo"
+version = "0.1.0"
+description = "Football video analysis pipeline using YOLO and ByteTrack"
+requires-python = ">=3.10"
+dependencies = [
+    "ultralytics>=8.0",
+    "supervision>=0.18",
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "roboflow>=1.3.10",
+]
+
+[project.scripts]
+football-analysis = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "trackers",
+    "camera_movement_estimator",
+    "view_transformer",
+    "speed_and_distance_estimator",
+    "team_assigner",
+    "player_ball_assigner",
+    "utils",
+]
