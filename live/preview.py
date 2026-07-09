@@ -14,9 +14,7 @@ so we resize to the calibration size before drawing to keep overlays aligned.
 """
 
 import os
-
 import cv2
-import numpy as np
 
 
 def _bgr_int(color, default=(0, 0, 255)):

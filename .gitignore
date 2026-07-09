@@ -19,3 +19,4 @@ output_videos/
 # IDE
 .idea/
 .vscode/
+.DS_Store

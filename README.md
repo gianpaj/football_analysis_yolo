@@ -24,6 +24,10 @@ Why this matters:
 - Per-player speed (`km/h`) and cumulative distance (`m`) estimation.
 - Rendered annotated output video with overlays for tracks, possession, camera movement, speed, and distance.
 - Stub-based caching for faster iteration during development.
+- **Live mode** (`main_live.py`): incremental frame-by-frame analysis of HLS/RTSP/webcam feeds, streaming per-frame JSON stats over a WebSocket.
+- Broadcast robustness for live feeds: scene-cut detection with a full state-reset contract, shot-type gating (close-ups/replays/graphics suppress tactical output), fixed-graphics region masking, and trajectory-consistent ball candidate selection.
+- Tunable inference for live throughput: confidence floors (global + stricter ball-only), inference resolution, device selection (CUDA/MPS/CPU), FP16, and detection stride.
+- Detector backbone benchmarking (`scripts/bench_models.py`): val mAP (ball-class AP separated) + per-frame latency.
 
 ## 3. Tech Stack
 - Python
@@ -34,6 +38,7 @@ Why this matters:
 - Pandas for interpolation of ball trajectories
 - scikit-learn (`KMeans`) for unsupervised team color clustering
 - Pickle for serialized stub caching
+- `websockets` (asyncio) for live stats broadcasting
 
 ## 4. Architecture / Workflow
 ```mermaid
@@ -60,27 +65,38 @@ M --> N[Output Video: output_videos/output_video.avi]
 ## 5. Project Structure
 ```text
 football_analysis_yolo/
-+-- main.py                                 # End-to-end pipeline orchestrator
-+-- yolo_inference.py                       # Standalone YOLO inference test script
-+-- image.png                               # Sample output snapshot
-+-- trackers/
-�   +-- tracker.py                          # Detection, ByteTrack tracking, annotations
-+-- camera_movement_estimator/
-�   +-- camera_movement_estimator.py        # Optical-flow camera motion estimation
-+-- view_transformer/
-�   +-- view_transformer.py                 # Perspective mapping to field coordinates
-+-- speed_and_distance_estimator/
-�   +-- speed_and_distance_estimator.py     # Speed/distance computation and overlays
-+-- team_assigner/
-�   +-- team_assigner.py                    # Team clustering from jersey color features
-+-- player_ball_assigner/
-�   +-- player_ball_assigner.py             # Ball possession assignment heuristic
-+-- utils/
-�   +-- video_utils.py                      # Video read/write helpers
-�   +-- bbox_utils.py                       # Geometric and distance helper functions
-+-- stubs/
-    +-- track_stubs.pkl                     # Cached object tracks
-    +-- camera_movement_stub.pkl            # Cached camera motion values
+├── main.py                                 # Offline (batch) pipeline orchestrator
+├── main_live.py                            # Live pipeline entry point (HLS/RTSP/webcam → WebSocket)
+├── live_preview.py                         # Detection-only visual check on a live source
+├── yolo_inference.py                       # Standalone YOLO inference test script
+├── image.png                               # Sample output snapshot
+├── trackers/
+│   └── tracker.py                          # Detection, ByteTrack tracking, annotations, live streaming methods
+├── camera_movement_estimator/
+│   └── camera_movement_estimator.py        # Optical-flow camera motion estimation (batch + streaming)
+├── view_transformer/
+│   └── view_transformer.py                 # Perspective mapping to field coordinates
+├── speed_and_distance_estimator/
+│   └── speed_and_distance_estimator.py     # Speed/distance computation and overlays (batch + streaming)
+├── team_assigner/
+│   └── team_assigner.py                    # Team clustering from jersey color features
+├── player_ball_assigner/
+│   └── player_ball_assigner.py             # Ball possession assignment heuristic
+├── live/                                   # Live-feed pipeline package
+│   ├── capture.py                          # ResilientCapture: threaded, auto-reopening frame source
+│   ├── scene_cut.py                        # SceneCutDetector: broadcast hard-cut detection
+│   ├── shot_gate.py                        # ShotTypeGate: tactical wide shot vs close-up/replay/graphic
+│   ├── broadcaster.py                      # StatsBroadcaster: asyncio WebSocket JSON server
+│   ├── pipeline.py                         # LiveFootballAnalyzer: per-frame orchestrator
+│   └── preview.py                          # Overlay drawing for --preview / --preview-file modes
+├── scripts/
+│   └── bench_models.py                     # Detector backbone benchmark (mAP + latency)
+├── utils/
+│   ├── video_utils.py                      # Video read/write helpers
+│   └── bbox_utils.py                       # Geometric and distance helper functions
+└── stubs/
+    ├── track_stubs.pkl                     # Cached object tracks
+    └── camera_movement_stub.pkl            # Cached camera motion values
 ```
 
 ## 6. Installation
@@ -220,11 +236,43 @@ python main_live.py --source 0 --no-ws
 
 # real broadcast HLS feed, stats served to WebSocket subscribers on :8765
 python main_live.py --source https://example.com/stream.m3u8 --model models/best.pt --ws-port 8765
+
+# fast path on Apple Silicon (MPS + lower inference resolution)
+python main_live.py --source <url> --device mps --imgsz 640 --inference-every 1
+
+# visual sanity check: OpenCV window with overlays, refreshed every 15 frames
+python main_live.py --source <url> --no-ws --preview --preview-every 15
 ```
 
-`--source` accepts an HLS `.m3u8` URL, an RTSP URL, a local file, or a webcam index. Connect any WebSocket client to `ws://<host>:8765` to receive one JSON message per processed frame: player positions/teams/speeds, ball position (or `null` when lost), running possession %, and a `camera_stable` flag.
+`--source` accepts an HLS `.m3u8` URL, an RTSP URL, a local file, or a webcam index. Connect any WebSocket client to `ws://<host>:8765` to receive one JSON message per processed frame: player positions/teams/speeds, ball position (or `null` when lost), running possession %, plus `camera_stable`, `tactical`, `scene_cut`, and `inference` flags.
 
-The live code lives in the additive `live/` package (`ResilientCapture`, `SceneCutDetector`, `StatsBroadcaster`, `LiveFootballAnalyzer`) and reuses the existing estimators via new streaming methods; the offline `main.py` path is unchanged. Known v1 limitations (multi-camera cuts gate position-derived stats rather than recalibrating homography; HLS inherently trails the live event by ~10–40 s; frames are resized to 1920×1080 to match the calibrated pixel constants) are documented in the plan and in `live/pipeline.py`.
+Key tuning flags:
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--conf` | `0.25` | Global detection confidence floor (offline path uses 0.1; live feeds want it stricter to suppress phantom detections) |
+| `--ball-conf` | `0.4` | Stricter floor for the ball class only — the noisiest class on a broadcast feed |
+| `--imgsz` | model default | Inference resolution; `640` is a good live default, `1280` helps tiny-ball recall |
+| `--device` | auto | `mps` (Apple Silicon), `cuda`/GPU index, or `cpu`; auto-prefers MPS on a Mac |
+| `--half` | off | FP16 inference on supported devices |
+| `--inference-every N` | `1` | Run YOLO + full analytics every N frames; cheap work (capture, scene-cut, optical flow, ball extrapolation) still runs every frame |
+| `--ignore-region X1 Y1 X2 Y2` | none | Drop detections inside a fixed graphics region (scorebug, watermark), as frame fractions 0–1; repeatable |
+| `--preview` / `--preview-every N` | off / `30` | OpenCV window with detection overlays, refreshed every N frames |
+| `--preview-file PATH` | none | Headless preview: atomically overwrite PATH with an annotated frame every `--preview-every` frames — works over SSH/remotely, no display needed (e.g. `--preview-file latest-frame.jpg`) |
+
+The live code lives in the additive `live/` package and reuses the existing estimators via streaming methods (`Tracker.track_frame`, `CameraMovementEstimator.update`, `SpeedAndDistance_Estimator.update`); the offline `main.py` path is unchanged. Two broadcast-specific safeguards run on every frame:
+
+- **`SceneCutDetector`** flags hard cuts between physical cameras (HSV-histogram divergence + pixel difference) and triggers a full reset of all inter-frame state — track IDs, team cache, speed buffers, optical flow — so nothing leaks across the cut.
+- **`ShotTypeGate`** classifies whether the current frame is a usable tactical wide shot (enough players, small boxes, lots of grass-green). On close-ups, replays, and full-screen graphics the `tactical` flag goes false and position-derived stats (pitch positions, speed, possession accumulation, ball trajectory state) are suppressed rather than poisoned with detector hallucinations.
+
+There is also a lighter `live_preview.py` for a detection-only visual check (YOLO + ByteTrack boxes in a window, no analytics):
+
+```bash
+python live_preview.py --source 0
+python live_preview.py --source <url> --save output_videos/live_preview.avi
+```
+
+Known v1 limitations: multi-camera cuts gate position-derived stats rather than recalibrating homography; HLS inherently trails the live event by ~10–40 s; frames are resized to 1920×1080 to match the calibrated pixel constants. Unlike the offline path, live speed/distance uses real wall-clock timestamps, so it is not tied to the 24 FPS assumption.
 
 ### 7.2 Benchmark detector backbones
 
@@ -268,7 +316,7 @@ Sample visualization:
 
 Trade-offs:
 - Team assignment via color clustering is efficient but sensitive to lighting, jersey similarity, and occlusion.
-- Fixed frame-rate assumptions (`24 FPS`) simplify speed estimation but should be generalized for production.
+- Fixed frame-rate assumptions (`24 FPS`) simplify speed estimation in the offline path; the live path already computes speed from real wall-clock timestamps.
 - Ball possession heuristic (nearest foot-point under threshold) is interpretable but can fail in dense crowding.
 
 Performance/scalability considerations:
