@@ -14,6 +14,7 @@ class Tracker:
                  conf=0.1, ball_conf=None, imgsz=None,
                  device=None, half=False, verbose=False):
         self.model = YOLO(model_path)
+        device = self._normalize_device(device)
         if device is not None:
             self.model.to(device)
         self.tracker = sv.ByteTrack()
@@ -38,6 +39,20 @@ class Tracker:
         self._ball_missing_frames = 0        # consecutive frames without a fresh detection
         self._max_ball_hold_frames = 10      # after this many missed frames, report ball lost
         self._max_ball_jump = max_ball_jump  # max plausible ball centre move between frames (px)
+
+    @staticmethod
+    def _normalize_device(device):
+        """Normalise a device spec for ``torch.nn.Module.to``.
+
+        A bare GPU index ("0", "1") is valid for Ultralytics' predict() but not
+        for torch's ``.to()`` (which needs "cuda:0"). Map it so the documented
+        ``--device 0`` form works. "cuda", "cpu", "mps", "cuda:0" pass through.
+        """
+        if isinstance(device, int):
+            return f"cuda:{device}"
+        if isinstance(device, str) and device.isdigit():
+            return f"cuda:{device}"
+        return device
 
     def track_frame(self, frame):
         """Detect + track a single frame for the live pipeline.

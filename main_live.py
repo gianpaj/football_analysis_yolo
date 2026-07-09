@@ -14,11 +14,16 @@ Detection recall vs speed (imgsz is the biggest lever on a 1920-wide feed):
 Player recall is driven by --imgsz and --conf; the ball is gated separately by
 --ball-conf, so keep --conf low (0.15) for player recall without phantom balls.
 
+Named sources (presets): pass a preset name to --source instead of a URL and
+the matching broadcast URL, HTTP headers, and graphics ignore-regions are
+applied automatically. See SOURCE_PRESETS below / run with --list-sources.
+
 Examples:
+    python main_live.py --source rtve --model models/best.pt   # RTVE La 1 (World Cup)
     python main_live.py --source <m3u8-url> --model models/best.pt --ws-port 8765
     python main_live.py --source 0 --no-ws --preview   # visual detection check
     # headless/remote preview to a file (no display needed):
-    python main_live.py --source <url> --preview-file latest-frame.jpg --preview-every 15
+    python main_live.py --source rtve --preview-file latest-frame.jpg --preview-every 15
     # Apple Silicon, tuned for FPS:
     python main_live.py --source <url> --device mps --imgsz 960 --inference-every 2
 """
@@ -29,8 +34,54 @@ import time
 
 import cv2
 
-from live import LiveFootballAnalyzer, ResilientCapture, StatsBroadcaster
+from live import (LiveFootballAnalyzer, ResilientCapture, StatsBroadcaster,
+                  build_ffmpeg_options)
 from live.preview import draw_stats_frame, write_frame_atomic
+
+
+# Named broadcast sources. Pass the key to --source and the URL, HTTP headers,
+# and default graphics ignore-regions (scorebug / channel logo, as fractions of
+# the frame) are filled in. Ignore-regions are overridden if you pass your own
+# --ignore-region. Coordinates are for the standard channel graphics; retune if
+# the broadcast overlay changes.
+SOURCE_PRESETS = {
+    # RTVE La 1 (Spain) — free-to-air public channel carrying FIFA World Cup
+    # 2026 matches. Clear (non-DRM) HLS rendition, 1280x720. Note: the RTVE
+    # live stream is normally geo-restricted to Spain. The DRM manifest (the
+    # site's default) is FairPlay-encrypted and NOT decodable by ffmpeg/OpenCV;
+    # this is the clear rendition (drop the "_drm" suffix).
+    "rtve-la1": {
+        "url": "https://rtvelivestream.rtve.es/rtvesec/la1/la1_main_dvr.m3u8",
+        "headers": {"Referer": "https://www.rtve.es/",
+                    "User-Agent": "Mozilla/5.0"},
+        # Top-left scorebug ("MM:SS  FRA 0-0 MAR") and top-right "1" channel
+        # logo. Both sit over crowd/stands, above pitch level, so masking them
+        # can't drop real players.
+        "ignore_regions": [[0.04, 0.03, 0.40, 0.13],
+                           [0.90, 0.07, 1.00, 0.18]],
+        "note": "RTVE La 1 — FIFA World Cup 2026 (geo-restricted to Spain)",
+    },
+    # Catalunya regional feed of the same channel.
+    "rtve-cat": {
+        "url": "https://rtvelivestream.rtve.es/rtvesec/cat/la1_cat_main_dvr.m3u8",
+        "headers": {"Referer": "https://www.rtve.es/",
+                    "User-Agent": "Mozilla/5.0"},
+        "ignore_regions": [[0.04, 0.03, 0.40, 0.13],
+                           [0.90, 0.07, 1.00, 0.18]],
+        "note": "RTVE La 1 Catalunya (geo-restricted to Spain)",
+    },
+}
+# Convenience alias.
+SOURCE_PRESETS["rtve"] = SOURCE_PRESETS["rtve-la1"]
+
+
+def resolve_source(source):
+    """Expand a preset name in ``source`` to (url, preset_dict).
+    Returns (source, None) unchanged when it isn't a known preset."""
+    preset = SOURCE_PRESETS.get(source)
+    if preset is None:
+        return source, None
+    return preset["url"], preset
 
 
 def _default_device():
@@ -53,8 +104,12 @@ def _default_device():
 
 def main():
     parser = argparse.ArgumentParser(description="Live football analysis over WebSocket")
-    parser.add_argument("--source", required=True,
-                        help="HLS .m3u8 URL, RTSP URL, local file, or webcam index (e.g. 0)")
+    parser.add_argument("--source",
+                        help="HLS .m3u8 URL, RTSP URL, local file, webcam index "
+                             "(e.g. 0), or a preset name (e.g. 'rtve'). "
+                             "Run --list-sources to see presets.")
+    parser.add_argument("--list-sources", action="store_true",
+                        help="List the named source presets and exit.")
     parser.add_argument("--model", default="models/best.pt", help="Path to YOLO model")
     parser.add_argument("--ws-host", default="0.0.0.0", help="WebSocket bind host")
     parser.add_argument("--ws-port", type=int, default=8765, help="WebSocket port")
@@ -105,6 +160,32 @@ def main():
                              "(default: 30).")
     args = parser.parse_args()
 
+    if args.list_sources:
+        print("Named source presets (pass the name to --source):\n")
+        seen = {}
+        for name, preset in SOURCE_PRESETS.items():
+            seen.setdefault(id(preset), []).append(name)
+        for names in seen.values():
+            preset = SOURCE_PRESETS[names[0]]
+            print(f"  {', '.join(sorted(names)):<20} {preset['note']}")
+            print(f"  {'':<20} {preset['url']}\n")
+        return
+
+    if not args.source:
+        parser.error("--source is required (a URL, webcam index, or preset name; "
+                     "see --list-sources)")
+
+    # Expand a preset name (e.g. 'rtve') into its URL + headers + ignore-regions.
+    source, preset = resolve_source(args.source)
+    ffmpeg_options = None
+    ignore_regions = args.ignore_region
+    if preset is not None:
+        print(f"Source preset '{args.source}': {preset['note']}")
+        ffmpeg_options = build_ffmpeg_options(headers=preset.get("headers"))
+        # Only apply the preset's graphics masks if the user didn't pass their own.
+        if not ignore_regions:
+            ignore_regions = preset.get("ignore_regions")
+
     broadcaster = None
     if not args.no_ws:
         broadcaster = StatsBroadcaster(host=args.ws_host, port=args.ws_port).start()
@@ -115,7 +196,7 @@ def main():
     analyzer = LiveFootballAnalyzer(
         args.model,
         broadcaster=broadcaster,
-        ignore_regions=args.ignore_region,
+        ignore_regions=ignore_regions,
         conf=args.conf,
         ball_conf=args.ball_conf,
         imgsz=args.imgsz,
@@ -125,9 +206,9 @@ def main():
         inference_stride=args.inference_every,
     )
 
-    print(f"Opening source: {args.source}")
+    print(f"Opening source: {source}")
     print(f"Using device: {device or 'auto (ultralytics default)'}  half={args.half}")
-    capture = ResilientCapture(args.source).start()
+    capture = ResilientCapture(source, ffmpeg_options=ffmpeg_options).start()
 
     preview_every = max(1, args.preview_every)
     want_frames = args.preview or bool(args.preview_file)

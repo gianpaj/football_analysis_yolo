@@ -9,6 +9,7 @@ failing (HLS playlist hiccups, network drops), the capture is reopened with a
 capped backoff.
 """
 
+import os
 import threading
 import time
 import queue
@@ -16,9 +17,29 @@ import queue
 import cv2
 
 
+def build_ffmpeg_options(headers=None, extra=None):
+    """Build an ``OPENCV_FFMPEG_CAPTURE_OPTIONS`` string.
+
+    ``headers`` is a dict of HTTP headers (e.g. ``{"Referer": "https://..."}``)
+    passed to FFmpeg's HLS/HTTP demuxer — needed by some broadcast CDNs that
+    gate on Referer/User-Agent. ``extra`` is a dict of raw FFmpeg AVOptions.
+    OpenCV's format is ``key;value`` pairs joined by ``|``; multiple HTTP
+    headers go in the single ``headers`` value, CRLF-separated.
+    Returns ``None`` when there's nothing to set.
+    """
+    opts = []
+    if headers:
+        blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        opts.append(f"headers;{blob}")
+    for k, v in (extra or {}).items():
+        opts.append(f"{k};{v}")
+    return "|".join(opts) if opts else None
+
+
 class ResilientCapture:
     def __init__(self, source, reopen_after_failures=30,
-                 backoff_initial=0.5, backoff_max=10.0):
+                 backoff_initial=0.5, backoff_max=10.0,
+                 ffmpeg_options=None):
         # A bare digit string (e.g. "0") is a webcam index, not a path/URL.
         if isinstance(source, str) and source.isdigit():
             source = int(source)
@@ -26,6 +47,10 @@ class ResilientCapture:
         self.reopen_after_failures = reopen_after_failures
         self.backoff_initial = backoff_initial
         self.backoff_max = backoff_max
+        # FFmpeg demuxer options (HTTP headers etc.) for cv2's FFMPEG backend.
+        # OpenCV reads this env var when VideoCapture(CAP_FFMPEG) is constructed,
+        # so we set it right before opening.
+        self.ffmpeg_options = ffmpeg_options
 
         self._queue = queue.Queue(maxsize=1)
         self._stop = threading.Event()
@@ -33,6 +58,8 @@ class ResilientCapture:
         self._cap = None
 
     def _open(self):
+        if self.ffmpeg_options:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = self.ffmpeg_options
         cap = cv2.VideoCapture(self.source, cv2.CAP_FFMPEG)
         return cap if cap.isOpened() else None
 
