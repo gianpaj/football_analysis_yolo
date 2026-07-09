@@ -13,11 +13,20 @@ import numpy as np
 
 
 class SceneCutDetector:
-    def __init__(self, hist_corr_threshold=0.5, mad_threshold=40.0, small_size=64):
+    def __init__(self, hist_corr_threshold=0.5, mad_threshold=40.0, small_size=64,
+                 max_dt=0.4):
         # Lower correlation => more different. Higher MAD => more different.
         self.hist_corr_threshold = hist_corr_threshold
         self.mad_threshold = mad_threshold
         self.small_size = small_size
+        # Only judge a cut between frames close in time. When consecutive
+        # *processed* frames arrive far apart (a slow/bursty live feed where the
+        # freshest-frame queue drops everything in between), normal play motion
+        # alone makes the frames look completely different, so the both-signals
+        # test still false-fires. Above this gap (seconds) we can't tell a real
+        # hard cut from accumulated motion, and a wrong reset (which clears all
+        # track IDs) is far more damaging than a missed one — so we skip.
+        self.max_dt = max_dt
 
     def _histogram(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -30,14 +39,21 @@ class SceneCutDetector:
         # different colours can share the same grayscale value).
         return cv2.resize(frame, (self.small_size, self.small_size))
 
-    def is_cut(self, prev_frame, frame):
+    def is_cut(self, prev_frame, frame, dt=None):
         """True if ``frame`` looks like a hard cut from ``prev_frame``.
 
         A cut needs *both* a diverging colour-histogram (low correlation) and a
         large pixel difference. Requiring both rejects fast pans (pixels move a
         lot but the colour distribution holds) and gentle fades/colour grades
-        (distribution shifts but pixels barely move)."""
+        (distribution shifts but pixels barely move).
+
+        ``dt`` is the wall-clock gap (seconds) since ``prev_frame`` was
+        processed; when it exceeds ``max_dt`` the frames are too far apart to
+        judge reliably, so we report no cut (see ``max_dt`` rationale)."""
         if prev_frame is None or frame is None:
+            return False
+
+        if dt is not None and dt > self.max_dt:
             return False
 
         corr = cv2.compareHist(self._histogram(prev_frame),

@@ -12,12 +12,24 @@ from utils import get_center_of_bbox, get_bbox_width, get_foot_position, measure
 class Tracker:
     def __init__(self, model_path, max_ball_jump=250,
                  conf=0.1, ball_conf=None, imgsz=None,
-                 device=None, half=False, verbose=False):
+                 device=None, half=False, verbose=False,
+                 track_activation_threshold=None, lost_track_buffer=30):
         self.model = YOLO(model_path)
         device = self._normalize_device(device)
         if device is not None:
             self.model.to(device)
-        self.tracker = sv.ByteTrack()
+        # ByteTrack. The offline path (track_activation_threshold=None) keeps
+        # supervision's stock defaults so main.py is unchanged. The live pipeline
+        # passes track_activation_threshold=conf: ByteTrack's default activation
+        # gate is 0.25, well above the live --conf floor (0.15), so players
+        # detected between the floor and 0.25 never spawn a track and vanish from
+        # the output even though YOLO found them. Matching it to conf keeps them.
+        if track_activation_threshold is not None:
+            self.tracker = sv.ByteTrack(
+                track_activation_threshold=track_activation_threshold,
+                lost_track_buffer=lost_track_buffer)
+        else:
+            self.tracker = sv.ByteTrack()
 
         # Inference thresholds. ``conf`` is the global detection confidence
         # floor; ``ball_conf`` is an optional *higher* floor applied only to the

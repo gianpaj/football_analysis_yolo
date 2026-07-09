@@ -70,7 +70,8 @@ class LiveFootballAnalyzer:
         # a stricter one still for the noisy ball class.
         self.tracker = Tracker(model_path, conf=conf, ball_conf=ball_conf,
                                imgsz=imgsz, device=device, half=half,
-                               verbose=yolo_verbose)
+                               verbose=yolo_verbose,
+                               track_activation_threshold=conf)
         # CameraMovementEstimator needs a seed frame; created lazily on frame 0.
         self.camera_movement_estimator = None
         self.view_transformer = ViewTransformer()
@@ -81,6 +82,7 @@ class LiveFootballAnalyzer:
         self.shot_gate = ShotTypeGate(min_players=min_players_for_team_fit)
 
         self._prev_frame = None
+        self._prev_timestamp = None
         self._frame_index = -1
         self._cooldown_remaining = 0
 
@@ -123,8 +125,12 @@ class LiveFootballAnalyzer:
         if self.camera_movement_estimator is None:
             self.camera_movement_estimator = CameraMovementEstimator(frame)
 
-        # 2. Scene-cut detection + reset contract.
-        scene_cut = self.scene_cut_detector.is_cut(self._prev_frame, frame)
+        # 2. Scene-cut detection + reset contract. Pass the wall-clock gap so the
+        #    detector can skip judging frames that arrived too far apart (a slow
+        #    feed), where a false reset would needlessly wipe all track IDs.
+        dt = (None if self._prev_timestamp is None
+              else timestamp - self._prev_timestamp)
+        scene_cut = self.scene_cut_detector.is_cut(self._prev_frame, frame, dt=dt)
         if scene_cut:
             self._apply_scene_cut_reset(frame)
             # Force a fresh detection on the first frame after a cut.
@@ -228,6 +234,7 @@ class LiveFootballAnalyzer:
             self._cooldown_remaining -= 1
 
         self._prev_frame = frame
+        self._prev_timestamp = timestamp
 
         stats = {
             "timestamp": timestamp,
