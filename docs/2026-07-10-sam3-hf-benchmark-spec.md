@@ -1,6 +1,6 @@
 # Design Spec — SAM 3 Zero-Shot Benchmark via Hugging Face
 
-> Status: **draft v1** · Owner: gianpaj · Last updated: 2026-07-10
+> Status: **implemented** (`scripts/bench_sam3_hf.py`) · Owner: gianpaj · Last updated: 2026-07-10
 >
 > Benchmarks Meta's **SAM 3** (`facebook/sam3`, via 🤗 `transformers`) as a
 > zero-shot, text-prompted detector on the football dataset, producing numbers
@@ -87,28 +87,37 @@ processor = Sam3Processor.from_pretrained(args.model_id)
 
 ### 3.2 Per-frame detection (`detect`)
 
-HF SAM 3 takes **one text concept per image** per forward pass, so the four
-classes are covered by batching the same frame four times with different
-prompts — a single forward pass, which is the honest equivalent of YOLO's
-single `predict()` call:
+HF SAM 3 takes **one text concept per image** per forward pass. Batching the
+same frame four times would work, but it re-runs the ViT image encoder — the
+dominant cost of an 840M-param model — once per class. Instead, encode the
+frame **once** and re-run only the cheap text/decoder half per concept. That
+is both faster and the honest equivalent of YOLO's single `predict()` call:
+one image encode, all classes out.
 
 ```python
-DEFAULT_PROMPTS = {0: "ball", 1: "goalkeeper", 2: "football player", 3: "referee"}
+DEFAULT_PROMPTS = {"ball": "ball", "goalkeeper": "goalkeeper",
+                   "player": "football player", "referee": "referee"}
 
 image = Image.fromarray(frame_bgr[:, :, ::-1])           # cv2 BGR → RGB
-images = [image] * len(prompts)
-inputs = processor(images=images, text=list(prompts.values()),
-                   return_tensors="pt").to(model.device)
+img_inputs = processor(images=image, return_tensors="pt").to(model.device)
 with torch.no_grad():
-    outputs = model(**inputs)
-results = processor.post_process_instance_segmentation(
-    outputs, threshold=args.conf, mask_threshold=0.5,
-    target_sizes=inputs.get("original_sizes").tolist())
-# → per concept: boxes (xyxy px), scores; tag each with its class_id
+    vision_embeds = model.get_vision_features(pixel_values=img_inputs.pixel_values)
+
+for class_id, text in prompts.items():
+    text_inputs = processor(text=text, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        outputs = model(vision_embeds=vision_embeds,
+                        input_ids=text_inputs["input_ids"],
+                        attention_mask=text_inputs.get("attention_mask"))
+    result = processor.post_process_instance_segmentation(
+        outputs, threshold=args.conf, mask_threshold=0.5,
+        target_sizes=img_inputs.get("original_sizes").tolist())[0]
+    # result: boxes (xyxy px), scores, masks → tag each box with class_id
 ```
 
-Returns `(boxes_xyxy, scores, class_ids)` arrays — the same shape of output
-the YOLO benchmark's predictions have.
+`--batched-prompts` selects the naive batch-the-frame-N-times path, so the two
+can be timed against each other. `detect()` returns an `sv.Detections` — the
+same object the ground-truth loader produces, which is what the metric eats.
 
 ### 3.3 Accuracy — zero-shot mAP on the val split
 
@@ -146,7 +155,11 @@ the YOLO benchmark's predictions have.
 | `--source` | `data/test.mp4` | latency frames (synthetic fallback) |
 | `--latency-frames` | `50` | lower than YOLO's 200 — SAM 3 is slow |
 | `--skip-latency` / `--skip-accuracy` | off | run one axis only |
+| `--device` | auto | `cuda` > `mps` > `cpu` |
 | `--dtype` | auto (fp16 GPU / fp32 CPU) | debugging override |
+| `--image-size` | `1008` | SAM 3's trained resolution; lower = faster, less accurate |
+| `--batched-prompts` | off | re-encode the frame per concept instead of sharing one encode |
+| `--selftest-map` | off | score the labels against themselves (~1.0), load no model |
 | `--out` | none | write results JSON |
 
 ### 3.6 Output
@@ -194,19 +207,30 @@ median ms / FPS`), one row per prompt-set run. JSON rows carry `model`,
 
 ## 6. Implementation plan
 
-1. `scripts/bench_sam3_hf.py` skeleton: CLI, model loading, `detect()`.
-2. Accuracy path: data.yaml/split parsing, YOLO-label loader, supervision mAP,
+1. ✅ `scripts/bench_sam3_hf.py` skeleton: CLI, model loading, `detect()`.
+2. ✅ Accuracy path: data.yaml/split parsing, YOLO-label loader, supervision mAP,
    ball AP extraction. Sanity-check the harness by feeding ground truth back in
-   as predictions (must score mAP ≈ 1.0).
-3. Latency path: import `load_frames`, timing loop, device recording.
-4. Summary table + JSON out; README pointer under the training/benchmark docs.
-5. Runs: default prompts on val (accuracy), 50-frame latency on `data/test.mp4`,
-   then a prompt sweep for `ball`.
+   as predictions (must score mAP ≈ 1.0) — exposed as `--selftest-map`.
+3. ✅ Latency path: import `load_frames`, timing loop, device recording.
+4. ✅ Summary table + JSON out; README §7.3 pointer.
+5. ⬜ Runs: default prompts on val (accuracy), 50-frame latency on `data/test.mp4`,
+   then a prompt sweep for `ball`. **Blocked on** the gated-repo licence and a
+   local copy of the dataset (neither is checked in).
 
 ### Acceptance criteria
 
-- Script runs latency-only with no dataset present (synthetic-frame fallback)
-  and prints actionable errors for missing dataset / gated HF repo.
-- Ground-truth self-test scores mAP50-95 ≥ 0.99.
-- One command produces a table row comparable to a `bench_models.py` row, and
+- ✅ Script runs latency-only with no dataset present (synthetic-frame fallback)
+  and prints actionable errors for missing dataset / gated HF repo / missing
+  `--extra sam3` install.
+- ✅ Ground-truth self-test scores mAP50-95 ≥ 0.99 (verified: `1.0`).
+- ✅ One command produces a table row comparable to a `bench_models.py` row, and
   `--out` JSON round-trips both axes with the resolved device and prompt set.
+
+### What is and isn't verified
+
+`detect()` was exercised against a stub implementing the documented SAM 3
+surface (both prompt paths, BGR→RGB, empty-concept handling), and every call it
+makes was checked against `modeling_sam3.py` / `processing_sam3.py` upstream.
+The dataset + mAP path is verified end to end on a synthetic YOLO-format split.
+**Nothing has been run against the real weights** — that needs the licence
+acceptance and the Roboflow download, i.e. step 5 above.
