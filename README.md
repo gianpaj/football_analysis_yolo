@@ -90,7 +90,8 @@ football_analysis_yolo/
 │   ├── pipeline.py                         # LiveFootballAnalyzer: per-frame orchestrator
 │   └── preview.py                          # Overlay drawing for --preview / --preview-file modes
 ├── scripts/
-│   └── bench_models.py                     # Detector backbone benchmark (mAP + latency)
+│   ├── bench_models.py                     # Detector backbone benchmark (mAP + latency)
+│   └── bench_sam3_hf.py                    # SAM 3 zero-shot benchmark (mAP + latency)
 ├── utils/
 │   ├── video_utils.py                      # Video read/write helpers
 │   └── bbox_utils.py                       # Geometric and distance helper functions
@@ -292,6 +293,34 @@ python scripts/bench_models.py \
 ```
 
 val mAP is only meaningful on weights fine-tuned on the football data (`--train`, or point `--models` at trained `best.pt` files); latency works on any base. Try `--imgsz 1280` to see the ball-recall vs latency trade-off.
+
+### 7.3 Benchmark SAM 3 as a zero-shot pre-labeler
+
+`scripts/bench_sam3_hf.py` scores Meta's [SAM 3](https://huggingface.co/facebook/sam3) — prompted with text concepts instead of fine-tuned — on the same two axes, so its rows sit next to the YOLO ones. The question it answers is whether SAM 3 is accurate enough to **pre-label frames** (see 6.2.1); at ~840M params it is not a live-detector candidate.
+
+`facebook/sam3` is a gated repo, and `transformers`/`accelerate` are an optional extra:
+
+```bash
+uv sync --extra sam3
+hf auth login   # after accepting the licence at huggingface.co/facebook/sam3
+```
+
+```bash
+# zero-shot mAP on the val split + per-frame latency for all four classes
+python scripts/bench_sam3_hf.py \
+  --data models/football-players-detection-1/data.yaml \
+  --source data/test.mp4 --out bench_sam3.json
+
+# prompt wording is the main accuracy knob for a zero-shot detector
+python scripts/bench_sam3_hf.py --skip-latency \
+  --data models/football-players-detection-1/data.yaml \
+  --prompts ball="soccer ball"
+
+# latency only — needs no dataset (falls back to synthetic frames)
+python scripts/bench_sam3_hf.py --skip-accuracy --source data/test.mp4
+```
+
+SAM 3 takes one text concept per forward pass, so the frame is encoded once and only the text/decoder half re-runs per class. `--selftest-map` scores the ground-truth labels against themselves (must print ~1.0) to check the scoring harness without downloading the model. Design notes: [`docs/2026-07-10-sam3-hf-benchmark-spec.md`](docs/2026-07-10-sam3-hf-benchmark-spec.md).
 
 ## 8. Example Output
 Generated artifact:

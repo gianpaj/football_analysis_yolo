@@ -14,6 +14,13 @@ dependencies = [
     "websockets>=11",
 ]
 
+[project.optional-dependencies]
+# Only scripts/bench_sam3_hf.py needs these; keep the main install lean.
+sam3 = [
+    "transformers>=4.57",
+    "accelerate>=0.26",
+]
+
 [project.scripts]
 football-analysis = "main:main"
 football-analysis-live = "main_live:main"
