@@ -51,10 +51,16 @@ must print ~1.0; needs no model download):
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import time
 from pathlib import Path
+
+# Route SAM 3 ops that MPS doesn't implement (RoPE / windowed attention corners)
+# to CPU instead of crashing the run. Must be set before torch is imported by
+# anything below; harmless off a Mac. `setdefault` respects an explicit opt-out.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import numpy as np
 import supervision as sv
@@ -110,12 +116,16 @@ def resolve_device(requested):
 
 
 def resolve_dtype(requested, device):
-    """fp16 on accelerators, fp32 on CPU (fp16 on CPU is slower, not faster)."""
+    """fp16 on CUDA; fp32 on CPU and MPS.
+
+    fp16-on-MPS is the more common way SAM 3 fails on a Mac (half-precision op
+    gaps, silent NaNs), so default MPS to fp32 -- pass `--dtype float16` to try
+    the faster path. fp16 on CPU is slower, not faster, so CPU is fp32 too."""
     import torch
 
     if requested and requested != "auto":
         return getattr(torch, requested)
-    return torch.float32 if device == "cpu" else torch.float16
+    return torch.float16 if device == "cuda" else torch.float32
 
 
 def load_model(model_id, device, dtype, image_size=None):

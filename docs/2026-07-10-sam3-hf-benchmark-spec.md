@@ -81,9 +81,13 @@ processor = Sam3Processor.from_pretrained(args.model_id)
 
 - `--model-id` defaults to `facebook/sam3`; also accepts the SAM3-LiteText
   checkpoint (same processor/prompting interface) for a lighter comparison run.
-- dtype: fp16 on CUDA/MPS, fp32 on CPU (`--dtype` override for debugging).
+- dtype: fp16 on CUDA, **fp32 on MPS and CPU** (`--dtype float16` to try the
+  faster path). fp16-on-MPS is the more common way SAM 3 fails on a Mac —
+  half-precision op gaps and silent NaNs — so the Mac default is the safe one.
 - This machine is macOS → MPS is the expected local device; CUDA on the Ubuntu
-  box used for training (see frame-extraction docs).
+  box used for training (see frame-extraction docs). The script sets
+  `PYTORCH_ENABLE_MPS_FALLBACK=1` at import so any op MPS hasn't implemented
+  (RoPE / windowed-attention corners) routes to CPU instead of crashing the run.
 
 ### 3.2 Per-frame detection (`detect`)
 
@@ -156,7 +160,7 @@ same object the ground-truth loader produces, which is what the metric eats.
 | `--latency-frames` | `50` | lower than YOLO's 200 — SAM 3 is slow |
 | `--skip-latency` / `--skip-accuracy` | off | run one axis only |
 | `--device` | auto | `cuda` > `mps` > `cpu` |
-| `--dtype` | auto (fp16 GPU / fp32 CPU) | debugging override |
+| `--dtype` | auto (fp16 CUDA / fp32 MPS+CPU) | `float16` to force half precision |
 | `--image-size` | `1008` | SAM 3's trained resolution; lower = faster, less accurate |
 | `--batched-prompts` | off | re-encode the frame per concept instead of sharing one encode |
 | `--selftest-map` | off | score the labels against themselves (~1.0), load no model |
